@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""qa-check-isolation — show that a project install stayed inside the project.
+
+Usage:  qa-check-isolation --fingerprint        one line: a hash of the user-level setup
+        qa-check-isolation <project-dir>        what the project holds, and what could clash
+
+--fingerprint hashes the names and link targets under ~/.claude/skills, ~/.claude/agents,
+~/.claude/plugins, ~/.cursor/{skills,agents,rules}, the content of ~/.claude/settings.json and
+~/.cursor/hooks.json, the MCP server names in ~/.claude.json and where ~/.qa-agent/bin points.
+Run it before and after `install.sh --project`: the same line means nothing of yours changed.
+
+With a project directory it lists what `install.sh --project` put there and reports:
+  SHADOWED  a personal skill of the same name exists in ~/.claude/skills; Claude Code uses the
+            personal one, so the project copy is not what runs
+  DOUBLE    the same hook is also registered for every project in ~/.claude/settings.json,
+            so it would run twice in this one
+Exit code 0: isolated, nothing clashes. 1: something to look at. Reads only; changes nothing.
+"""
+import hashlib, json, os, sys
+
+HOME = os.path.expanduser("~")
+TK = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+MARK = ".toolkit-managed"
+HOOKS = ("qa-guard", "qa-test-lint", "qa-stage-gate", "qa-path")
+
+
+def listing(path, depth=1):
+    out = []
+    if not os.path.isdir(path):
+        return [f"{path}: absent"]
+    for root, dirs, files in os.walk(path):
+        rel = os.path.relpath(root, path)
+        level = 0 if rel == "." else rel.count(os.sep) + 1
+        for n in sorted(dirs + files):
+            p = os.path.join(root, n)
+            out.append(f"{os.path.join(rel, n)} -> {os.readlink(p)}" if os.path.islink(p) else os.path.join(rel, n))
+        dirs[:] = [d for d in sorted(dirs) if level + 1 < depth and not os.path.islink(os.path.join(root, d))]
+    return out
+
+
+def content(path):
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return "absent"
+
+
+def fingerprint():
+    parts = []
+    for d, depth in ((".claude/skills", 1), (".claude/agents", 1), (".claude/plugins", 3),
+                     (".cursor/skills", 1), (".cursor/agents", 1), (".cursor/rules", 1)):
+        parts += [d] + listing(os.path.join(HOME, d), depth)
+    for f in (".claude/settings.json", ".cursor/hooks.json", ".cursor/mcp.json"):
+        parts.append(f"{f} {content(os.path.join(HOME, f))}")
+    try:
+        with open(os.path.join(HOME, ".claude.json"), encoding="utf-8") as fh:
+            parts.append("mcp " + ",".join(sorted((json.load(fh).get("mcpServers") or {}).keys())))
+    except (OSError, ValueError):
+        parts.append("mcp absent")
+    b = os.path.join(HOME, ".qa-agent", "bin")
+    parts.append("bin " + (os.readlink(b) if os.path.islink(b) else "dir" if os.path.isdir(b) else "absent"))
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
+
+
+def hook_commands(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            hooks = json.load(fh).get("hooks", {})
+    except (OSError, ValueError):
+        return []
+    return [h.get("command", "") for entries in hooks.values() for e in entries for h in e.get("hooks", [])]
+
+
+def ours(cmds):
+    return sorted({s for c in cmds for s in HOOKS if f"/{s}" in c})
+
+
+def project(p):
+    p = os.path.abspath(os.path.expanduser(p))
+    sdir, adir = os.path.join(p, ".claude", "skills"), os.path.join(p, ".claude", "agents")
+    skills = sorted(n for n in (os.listdir(sdir) if os.path.isdir(sdir) else [])
+                    if os.path.isfile(os.path.join(sdir, n, MARK)))
+    agents = sorted(n for n in (os.listdir(adir) if os.path.isdir(adir) else []) if n.startswith("qa-"))
+    phooks = ours(hook_commands(os.path.join(p, ".claude", "settings.json")))
+    print(f"project   {p}")
+    print(f"  skills  {len(skills)} in .claude/skills")
+    print(f"  agents  {len(agents)} in .claude/agents")
+    print(f"  hooks   {', '.join(phooks) or 'none'} in .claude/settings.json")
+    if not skills:
+        print("  nothing installed here: run install.sh --project " + p)
+        return 1
+    problems = 0
+    # leftover home-relative toolkit paths in the copies
+    stale = []
+    for root, _, files in os.walk(os.path.join(p, ".claude")):
+        for f in files:
+            if f.endswith((".md", ".html")):
+                with open(os.path.join(root, f), encoding="utf-8", errors="replace") as fh:
+                    t = fh.read()
+                if "/.qa-agent/bin" in t or "/.qa-agent/toolkit" in t:
+                    stale.append(os.path.relpath(os.path.join(root, f), p))
+    if stale:
+        problems += 1
+        print(f"  STALE   {len(stale)} file(s) still point at ~/.qa-agent/bin or ~/.qa-agent/toolkit: {', '.join(stale[:5])}")
+    else:
+        print("  paths   every toolkit path in the copies points at the clone, none at ~/.qa-agent")
+
+    print(f"user      {HOME}")
+    personal = os.path.join(HOME, ".claude", "skills")
+    shadowed = [n for n in skills if os.path.lexists(os.path.join(personal, n))]
+    if shadowed:
+        problems += 1
+        print(f"  SHADOWED {len(shadowed)} of {len(skills)} skills also exist in ~/.claude/skills; the personal ones win:")
+        print("           " + ", ".join(shadowed[:8]) + (" …" if len(shadowed) > 8 else ""))
+    else:
+        print("  skills  no personal skill shares a name with a project one")
+    uagents = os.path.join(HOME, ".claude", "agents")
+    same = [n for n in agents if os.path.lexists(os.path.join(uagents, n))]
+    if same:
+        print(f"  note    {len(same)} agent name(s) also exist in ~/.claude/agents; in this project the project ones win")
+    double = [h for h in ours(hook_commands(os.path.join(HOME, ".claude", "settings.json"))) if h in phooks]
+    if double:
+        problems += 1
+        print(f"  DOUBLE  {', '.join(double)} also registered in ~/.claude/settings.json; they would run twice here")
+    else:
+        print("  hooks   none of the toolkit's hooks is registered for every project")
+    print("  plugins and connectors are not read or written by a project install; plugin skills are")
+    print("          namespaced (plugin:skill), so a project skill cannot replace one")
+    print("result    " + ("isolated: nothing clashes" if not problems else f"{problems} thing(s) to look at, see above"))
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    if a == ["--fingerprint"]:
+        print(fingerprint())
+    elif len(a) == 1 and not a[0].startswith("-"):
+        sys.exit(project(a[0]))
+    else:
+        sys.exit(__doc__.strip())
