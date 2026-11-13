@@ -15,6 +15,98 @@ Nothing here belongs to one project: every project selects its own settings at r
 Requirements: macOS or Linux, `bash`, `git`, Python 3.9+ (standard library only), and
 Claude Code and/or Cursor.
 
+There are two ways to install. Start with the first: it cannot touch anything you already
+have.
+
+| | One project (isolated) | Every project (global) |
+|---|---|---|
+| Command | `install.sh --project <dir>` | `install.sh` |
+| Skills and agents go to | `<dir>/.claude/skills`, `<dir>/.claude/agents` | `~/.claude/…` and `~/.cursor/…` |
+| Hooks go to | `<dir>/.claude/settings.json` | `~/.claude/settings.json`, `~/.cursor/hooks.json` |
+| Commands on `PATH` | only inside that project's Claude Code sessions | `~/.qa-agent/bin` |
+| Your skills, plugins, connectors | not read, not written | kept; anything in the way is backed up |
+| IDE | Claude Code | Claude Code and Cursor |
+
+### Try it in one project (isolated)
+
+Clone the toolkit anywhere outside the project (a path without spaces) and install it into
+the project you want to try it on:
+
+```bash
+git clone https://github.com/YevheniiaQA/qa-agent-toolkit.git ~/qa-agent-toolkit
+```
+
+```bash
+~/qa-agent-toolkit/bin/qa-check-isolation --fingerprint      # 1. note the line it prints
+```
+
+```bash
+~/qa-agent-toolkit/install.sh --project ~/work/my-project --dry-run   # 2. see what would change
+```
+
+```bash
+~/qa-agent-toolkit/install.sh --project ~/work/my-project    # 3. install
+```
+
+```bash
+~/qa-agent-toolkit/bin/qa-check-isolation --fingerprint      # 4. must print the same line as in step 1
+```
+
+```bash
+~/qa-agent-toolkit/bin/qa-check-isolation ~/work/my-project  # 5. must end with "isolated: nothing clashes"
+```
+
+Then open the project in Claude Code (`cd ~/work/my-project && claude`) and check there:
+
+- `/skills` lists the 35 toolkit skills as project skills, next to your own;
+- `/agents` lists the 14 `qa-*` agents as project agents;
+- `/hooks` shows `qa-guard`, `qa-test-lint`, `qa-stage-gate` and `qa-path` under *Project*;
+- in any other folder none of them appear.
+
+Start with *"set up this project for QA"* (`project-setup`), then
+*"run the QA pipeline for <ticket URL>"* (`qa-orchestrator`).
+
+**What the project install writes** — only these, all inside the project:
+
+| Path | What |
+|---|---|
+| `<dir>/.claude/skills/<name>/` | a copy of each skill, marked with `.toolkit-managed` |
+| `<dir>/.claude/agents/qa-*.md` | the Claude Code build of each stage agent |
+| `<dir>/.claude/settings.json` | four hooks merged in; your other settings and hooks are kept, the previous file is saved as `settings.json.bak-<timestamp>` |
+
+It never writes to `~/.claude`, `~/.cursor`, `~/.claude.json` or `~/.qa-agent/bin`, so
+personal skills, plugins, MCP servers and connectors stay exactly as they were. A skill or
+agent of yours with the same name inside the project is skipped, never overwritten.
+The hooks run only in that project's sessions; `qa-guard` additionally does nothing until
+the project has a `.qa-project` file. The toolkit keeps its own state (project profiles,
+logs) in `~/.qa-agent/`, a folder of its own that Claude Code does not read; set
+`QA_AGENT_HOME` to move it.
+
+**What the checks mean**
+
+| `qa-check-isolation` says | Meaning | What to do |
+|---|---|---|
+| same fingerprint before and after | nothing user-level changed: skills, agents, plugins, hooks, MCP server names | nothing |
+| `isolated: nothing clashes` | the project copies are what Claude Code will use | nothing |
+| `SHADOWED` | a personal skill in `~/.claude/skills` has the same name; Claude Code prefers the personal one | you already have the toolkit installed globally: use that, or remove those personal skills first |
+| `DOUBLE` | the same hook is also registered for every project | `hooks/register.py --remove` in the global copy, or skip the project install |
+| `STALE` | a copied file still points at `~/.qa-agent` | re-run `install.sh --project <dir>` |
+
+After `git pull` in the clone, re-run `install.sh --project <dir>` to refresh the copies.
+Commit `<dir>/.claude/` only if the whole team has the toolkit at the same path: the hook
+commands and skill paths are absolute.
+
+**Remove it again**
+
+```bash
+~/qa-agent-toolkit/install.sh --project ~/work/my-project --uninstall
+```
+
+Removes the copied skills (those with `.toolkit-managed`), the built `qa-*` agents and the
+four hooks; everything else in `<dir>/.claude` stays.
+
+### Install for every project (global)
+
 ```bash
 git clone https://github.com/YevheniiaQA/qa-agent-toolkit.git ~/.qa-agent/toolkit
 ~/.qa-agent/toolkit/install.sh --dry-run    # see what would change
@@ -94,8 +186,8 @@ a Cursor build of each to `build/`.
 | `skills/` | one folder per skill, `SKILL.md` + optional `references/` | `~/.cursor/skills/<name>`, `~/.claude/skills/<name>` (symlinks) |
 | `agents/` | stage agents (`qa-*`), one source each; `bin/qa-build-agents` writes a Claude and a Cursor build to `build/` | `~/.claude/agents`, `~/.cursor/agents` (symlinks to `build/<ide>/agents/`) |
 | `rules/` | IDE rules (`.mdc`) | `~/.cursor/rules` |
-| `hooks/` | `qa-guard` (integration boundary) + `integrations.json`, `prices.json` (stage cost), `qa-stage-gate` (no stage done without its gate file), `qa-test-lint` (test files checked on write), `register.py` | `~/.claude/settings.json`, `~/.cursor/hooks.json` (registered by `install.sh`) |
-| `bin/` | `qa-gate`, `qa-pipeline`, `qa-critic`, `qa-guard`, `qa-build-agents`, `skill-lint`, `qa-event`, `qa-metrics`, `qa-env.sh`, `qa-check-*`, `qa-prune` | `~/.qa-agent/bin` (symlink, on `PATH`) |
+| `hooks/` | `qa-guard` (integration boundary) + `integrations.json`, `prices.json` (stage cost), `qa-stage-gate` (no stage done without its gate file), `qa-test-lint` (test files checked on write), `qa-path` (project installs: `bin/` on `PATH`), `register.py` | `~/.claude/settings.json`, `~/.cursor/hooks.json` (registered by `install.sh`) |
+| `bin/` | `qa-gate`, `qa-pipeline`, `qa-critic`, `qa-guard`, `qa-build-agents`, `skill-lint`, `qa-event`, `qa-metrics`, `qa-env.sh`, `qa-check-*`, `qa-check-isolation`, `qa-prune` | `~/.qa-agent/bin` (symlink, on `PATH`) |
 | `templates/` | `AGENTS.md` and `CLAUDE.md` for a new workspace | copied by project-setup |
 | `schemas/` | JSON Schemas for gate files, pipeline state, artefacts, metric events | read by `qa-gate` |
 | `metrics/` | `catalog.json`: every metric's description, formula and cadence | read by `qa-metrics --html` |

@@ -7,6 +7,20 @@ follow [Semantic Versioning](https://semver.org/) as described in
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-11-13
+
+### Added
+- `install.sh --project DIR`: installs skills, agents and hooks into `DIR/.claude` only,
+  for one project, without touching `~/.claude`, `~/.cursor` or `~/.qa-agent/bin`;
+  `--uninstall` removes exactly what it installed.
+- `bin/qa-check-isolation`: a fingerprint of the user-level setup to compare before and
+  after, and a report of name clashes (`SHADOWED`, `DOUBLE`, `STALE`) for a project.
+- `hooks/qa-path`: SessionStart hook of a project install that puts the toolkit's `bin/`
+  on `PATH` for that project's sessions; `hooks/register.py --project DIR`.
+
+### Changed
+- `qa-env.sh` honours `QA_AGENT_HOME`, as the hooks already did.
+
 ## [1.0.0] — 2026-11-13
 
 First public release.
@@ -28,5 +42,6 @@ First public release.
 - Cursor rules, workspace templates (`AGENTS.md`, `CLAUDE.md`), `install.sh` and a
   pre-commit hook (`skill-lint`, agent build check).
 
-[Unreleased]: https://github.com/YevheniiaQA/qa-agent-toolkit/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/YevheniiaQA/qa-agent-toolkit/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/YevheniiaQA/qa-agent-toolkit/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/YevheniiaQA/qa-agent-toolkit/releases/tag/v1.0.0
