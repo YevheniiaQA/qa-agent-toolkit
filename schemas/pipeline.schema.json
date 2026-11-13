@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Pipeline state",
+  "description": "02-analysis/<TICKET>/_pipeline.json, kept by qa-orchestrator. A stage may be 'passed' only when qa-gate check-stage --require-passed accepts its gate file; qa-gate check-pipeline enforces that.",
+  "type": "object",
+  "required": [
+    "ticket",
+    "updatedAt",
+    "stages"
+  ],
+  "properties": {
+    "ticket": {
+      "type": "string",
+      "minLength": 1
+    },
+    "mode": {
+      "enum": [
+        "pipeline",
+        "parallel_types",
+        "single_skill",
+        "batch_issues",
+        "resume",
+        "degraded",
+        "verify"
+      ]
+    },
+    "updatedAt": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}"
+    },
+    "stages": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "enum": [
+              "pending",
+              "running",
+              "passed",
+              "failed",
+              "skipped",
+              "blocked"
+            ]
+          },
+          "startedAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finishedAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "gateFile": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "artefacts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "deferredOn": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      }
+    },
+    "needsEngineer": {
+      "type": "array"
+    }
+  }
+}

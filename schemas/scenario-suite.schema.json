@@ -1,0 +1,208 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Scenario suite",
+  "description": "02-analysis/<TICKET>/scenarios/<level>.json, written by scenarios-generator. Traceability, coverage and placeholder rules are checked by qa-gate scenarios, not here.",
+  "type": "object",
+  "required": [
+    "testSuite"
+  ],
+  "properties": {
+    "testSuite": {
+      "type": "object",
+      "required": [
+        "name",
+        "testCases"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "level": {
+          "type": "string"
+        },
+        "ticket": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "nfrWaivers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "requirementId",
+              "reason"
+            ],
+            "properties": {
+              "requirementId": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string",
+                "minLength": 5
+              },
+              "revisitWhen": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "blockedBy": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          }
+        },
+        "testCases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/case"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "case": {
+      "type": "object",
+      "required": [
+        "id",
+        "name",
+        "priority",
+        "technique",
+        "status",
+        "testSteps",
+        "traceability"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^TC-[A-Za-z0-9-]+$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 5
+        },
+        "level": {
+          "type": "string"
+        },
+        "priority": {
+          "enum": [
+            "CRITICAL",
+            "HIGH",
+            "MEDIUM",
+            "LOW"
+          ]
+        },
+        "technique": {
+          "type": "string",
+          "pattern": "^[a-z]+(-[a-z]+)*$"
+        },
+        "status": {
+          "enum": [
+            "ready",
+            "known-defect",
+            "undecided",
+            "unprobed",
+            "needs-verification",
+            "draft",
+            "investigating"
+          ]
+        },
+        "expectedOutcome": {
+          "enum": [
+            "pass",
+            "fail",
+            "blocked"
+          ]
+        },
+        "doNotRelax": {
+          "type": "boolean"
+        },
+        "testSteps": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "action",
+              "expectedResult"
+            ],
+            "properties": {
+              "stepNumber": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "action": {
+                "type": "string",
+                "minLength": 1
+              },
+              "inputData": {
+                "type": [
+                  "string",
+                  "object",
+                  "array",
+                  "null"
+                ]
+              },
+              "expectedResult": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "traceability": {
+          "type": "object",
+          "required": [
+            "requirementIds"
+          ],
+          "properties": {
+            "requirementIds": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string"
+              }
+            },
+            "acceptanceCriteria": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "userStory": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "preconditions": {
+          "type": "array"
+        },
+        "postconditions": {
+          "type": "array"
+        },
+        "cleanup": {
+          "type": "array"
+        },
+        "classesCovered": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    }
+  }
+}
