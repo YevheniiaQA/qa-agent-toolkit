@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Test report</title>
+<style>
+  :root{
+    --bg:#fbfbfa; --panel:#fff; --ink:#1a1a18; --muted:#6b6b66; --line:#e6e4df;
+    --pass:#2f7d5a; --pass-bg:#eaf4ee;
+    --known:#8a6d2f; --known-bg:#faf3e2;
+    --fail:#b4402f; --fail-bg:#fbecea;
+    --block:#5a5f8a; --block-bg:#eef0f7;
+    --crit:#8f2d1f;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#17171a; --panel:#1f1f23; --ink:#eceae5; --muted:#9a978f; --line:#32323a;
+      --pass:#7fc4a0; --pass-bg:#1d2a24;
+      --known:#d6b36a; --known-bg:#2a2419;
+      --fail:#e08a7a; --fail-bg:#2c1d1a;
+      --block:#a3a8d4; --block-bg:#1f2030;
+      --crit:#ef9b8b;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.6 ui-sans-serif,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:1060px;margin:0 auto;padding:36px 22px 90px}
+  h1{font-size:27px;margin:0 0 6px;letter-spacing:-.015em}
+  h2{font-size:17px;margin:40px 0 12px;letter-spacing:-.005em}
+  h2 .hint{font-weight:400;font-size:13px;color:var(--muted);margin-left:8px}
+  .sub{color:var(--muted);font-size:14px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px}
+  .pad{padding:16px 18px}
+
+  .verdict{margin:22px 0 4px;padding:18px 20px;border-radius:10px;border:1px solid var(--line);
+    background:var(--panel);border-left-width:4px}
+  .verdict.go{border-left-color:var(--pass)}
+  .verdict.conditional{border-left-color:var(--known)}
+  .verdict.nogo{border-left-color:var(--fail)}
+  .verdict .v{font-size:12px;letter-spacing:.06em;text-transform:uppercase;font-weight:700}
+  .verdict.go .v{color:var(--pass)} .verdict.conditional .v{color:var(--known)}
+  .verdict.nogo .v{color:var(--fail)}
+  .verdict p{margin:6px 0 0;font-size:15px}
+  .verdict ul{margin:10px 0 0;padding-left:20px;font-size:14px}
+  .verdict li{margin:3px 0}
+
+  .facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));
+    border:1px solid var(--line);border-radius:10px;overflow:hidden;margin:14px 0 4px;background:var(--panel)}
+  .fact{padding:12px 16px;border-right:1px solid var(--line)}
+  .fact:last-child{border-right:none}
+  .fact .k{font-size:11.5px;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}
+  .fact .v{font-size:14px;margin-top:3px}
+
+  .strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(118px,1fr));gap:10px;margin:14px 0 8px}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+  .stat .n{font-size:27px;font-weight:600;line-height:1.1;letter-spacing:-.02em}
+  .stat .l{font-size:12px;color:var(--muted);margin-top:3px}
+  .stat.pass .n{color:var(--pass)} .stat.known .n{color:var(--known)}
+  .stat.fail .n{color:var(--fail)} .stat.block .n{color:var(--block)}
+
+  .note{font-size:13.5px;color:var(--muted);margin:10px 0 0}
+  .note strong{color:var(--ink)}
+
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th{text-align:left;font-weight:600;font-size:11.5px;letter-spacing:.04em;
+     text-transform:uppercase;color:var(--muted);padding:10px 12px;border-bottom:1px solid var(--line)}
+  td{padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+  tr:last-child td{border-bottom:none}
+  code{font:12.5px ui-monospace,SFMono-Regular,Menlo,monospace;
+    background:var(--bg);padding:1px 5px;border-radius:4px;border:1px solid var(--line)}
+
+  .tag{display:inline-block;font-size:11.5px;font-weight:600;padding:2px 8px;
+    border-radius:20px;white-space:nowrap}
+  .t-pass{background:var(--pass-bg);color:var(--pass)}
+  .t-known{background:var(--known-bg);color:var(--known)}
+  .t-fail{background:var(--fail-bg);color:var(--fail)}
+  .t-block{background:var(--block-bg);color:var(--block)}
+
+  .defect{border-left:3px solid var(--line);padding:14px 16px;margin-bottom:10px;
+    background:var(--panel);border-radius:0 10px 10px 0}
+  .defect.silent{border-left-color:var(--crit)}
+  .defect h3{margin:0 0 4px;font-size:15px}
+  .defect .meta{font-size:12.5px;color:var(--muted);margin-bottom:8px}
+  .defect p{margin:0 0 8px;font-size:14px}
+  .callout{background:var(--fail-bg);color:var(--fail);font-size:13px;
+    padding:8px 11px;border-radius:7px;display:inline-block;font-weight:500}
+
+  ul.plain{margin:0;padding-left:20px;font-size:14px}
+  ul.plain li{margin:5px 0}
+
+  .controls{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+  button{font:inherit;font-size:13px;padding:6px 13px;border:1px solid var(--line);
+    background:var(--panel);color:var(--ink);border-radius:20px;cursor:pointer}
+  button[aria-pressed="true"]{background:var(--ink);color:var(--panel);border-color:var(--ink)}
+
+  .runs{display:inline-flex;gap:3px}
+  .runs i{width:8px;height:8px;border-radius:2px;display:block}
+  .r-pass{background:var(--pass)} .r-fail{background:var(--fail)} .r-skip{background:var(--line)}
+
+  .signoff{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;font-size:14px}
+  .signoff div span{display:block;font-size:11.5px;letter-spacing:.04em;
+    text-transform:uppercase;color:var(--muted);margin-bottom:3px}
+
+  .empty{color:var(--muted);font-size:14px;padding:14px 0}
+  footer{margin-top:44px;padding-top:16px;border-top:1px solid var(--line);
+    font-size:12.5px;color:var(--muted)}
+
+  @media print{
+    :root{--bg:#fff;--panel:#fff;--ink:#000;--muted:#555;--line:#ccc}
+    body{font-size:11pt}
+    .wrap{max-width:none;padding:0}
+    .controls{display:none}
+    h2{page-break-after:avoid}
+    .defect,.verdict,tr{page-break-inside:avoid}
+  }
+</style>
+</head>
+<body>
+<div class="wrap" id="app"></div>
+
+<script id="report-data" type="application/json">
+{"meta":{},"verdict":{},"scope":{},"summary":{},"defectSummary":{},"requirements":[],"defects":[],"tests":[],"stability":{},"performance":{},"security":{},"limitations":[],"recommendations":[],"openQuestions":[]}
+</script>
+
+<script>
+(function(){
+  const d = JSON.parse(document.getElementById('report-data').textContent);
+  const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g,
+    c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  const m = d.meta||{}, s = d.summary||{}, v = d.verdict||{}, sc = d.scope||{},
+        st = d.stability||{}, ds = d.defectSummary||{}, pf = d.performance||{}, sec = d.security||{};
+  const P = [];
+
+  P.push(`<h1>${esc(m.title || 'Test report')}</h1>
+    <div class="sub">${esc(m.ticket||'')}${m.release ? ' · ' + esc(m.release) : ''}${m.reportVersion ? ' · report ' + esc(m.reportVersion) : ''}</div>`);
+
+  const facts = [
+    ['Test period', m.testPeriod], ['Report date', m.reportDate],
+    ['Build / contract', m.build], ['Environment', m.environment],
+    ['Prepared by', m.preparedBy]
+  ].filter(f => f[1]);
+  if (facts.length) P.push('<div class="facts">' + facts.map(([k,val]) =>
+    `<div class="fact"><div class="k">${k}</div><div class="v">${esc(val)}</div></div>`).join('') + '</div>');
+
+  if (v.status) {
+    const cls = {go:'go', conditional:'conditional', 'no-go':'nogo'}[v.status] || 'conditional';
+    const label = {go:'Ready to release', conditional:'Release with conditions',
+                   'no-go':'Not ready to release'}[v.status] || v.status;
+    P.push(`<div class="verdict ${cls}"><div class="v">${esc(label)}</div>
+      ${v.statement ? `<p>${esc(v.statement)}</p>` : ''}
+      ${(v.conditions||[]).length ? '<ul>' + v.conditions.map(c => `<li>${esc(c)}</li>`).join('') + '</ul>' : ''}
+    </div>`);
+  }
+
+  if ((sc.included||[]).length || (sc.excluded||[]).length) {
+    P.push('<h2>Scope<span class="hint">what this report does and does not cover</span></h2><div class="panel pad">');
+    if ((sc.included||[]).length) P.push('<strong style="font-size:13.5px">Tested</strong><ul class="plain">' +
+      sc.included.map(x => `<li>${esc(x)}</li>`).join('') + '</ul>');
+    if ((sc.excluded||[]).length) P.push('<strong style="font-size:13.5px;display:block;margin-top:12px">Not tested</strong><ul class="plain">' +
+      sc.excluded.map(x => `<li>${esc(x)}</li>`).join('') + '</ul>');
+    P.push('</div>');
+  }
+
+  const stats = [
+    ['pass',  s.passed,             'Passed'],
+    ['known', s.expectedFailures,   'Known defects'],
+    ['fail',  s.unexpectedFailures, 'Unexpected failures'],
+    ['block', s.blocked,            'Blocked'],
+    ['block', s.flaky,              'Unstable']
+  ].filter(r => r[1] != null);
+  if (stats.length) {
+    P.push('<h2>Results</h2><div class="strip">' + stats.map(([c,n,l]) =>
+      `<div class="stat ${c}"><div class="n">${esc(n)}</div><div class="l">${l}</div></div>`).join('') + '</div>');
+    if (s.expectedFailures) P.push(`<p class="note"><strong>${esc(s.expectedFailures)} tests fail by design.</strong>
+      They assert what the specification requires against behaviour the system does not yet implement.
+      Each is linked to a defect below, and each turns green the moment that defect is fixed — which is
+      how the fix gets detected. They are evidence, not breakage.</p>`);
+  }
+
+  const sevs = [['critical', ds.critical], ['major', ds.major], ['minor', ds.minor]].filter(x => x[1]);
+  if (sevs.length) P.push('<p class="note">Defects raised: ' +
+    sevs.map(([k,n]) => `<strong>${esc(n)} ${k}</strong>`).join(' · ') + '</p>');
+
+  const defs = (d.defects||[]).slice().sort((a,b)=>(b.silent?1:0)-(a.silent?1:0));
+  if (defs.length) {
+    P.push('<h2>Defects</h2>');
+    if (defs.some(x=>x.silent)) P.push('<p class="note">Defects marked below return a success response to the caller. Nothing surfaces them to a user, so they will not be reported from the field.</p>');
+    defs.forEach(x => P.push(`<div class="defect${x.silent?' silent':''}">
+      <h3>${esc(x.id)} — ${esc(x.title)}</h3>
+      <div class="meta">${esc(x.severity||'')}${x.tests?' · demonstrated by '+x.tests.map(esc).join(', '):''}${x.firstSeen?' · first observed '+esc(x.firstSeen):''}</div>
+      ${x.detail?`<p>${esc(x.detail)}</p>`:''}
+      ${x.impact?`<p><strong>Impact:</strong> ${esc(x.impact)}</p>`:''}
+      ${x.callerSees?`<div class="callout">The caller sees ${esc(x.callerSees)}</div>`:''}
+    </div>`));
+  }
+
+  const reqs = d.requirements||[];
+  if (reqs.length) {
+    const label = { covered:['t-pass','Covered'], 'covered-failing':['t-known','Covered (failing)'],
+      partial:['t-block','Partial'], blocked:['t-fail','Blocked'], waived:['t-block','Waived'] };
+    P.push('<h2>Requirement coverage<span class="hint">classes covered compares what a requirement implies against what is asserted</span></h2>' +
+      '<div class="panel"><table><thead><tr><th>Requirement</th><th>Status</th><th>Scenarios</th>' +
+      '<th>Assertions</th><th>Classes</th><th>Note</th></tr></thead><tbody>' + reqs.map(r => {
+        const [cls, txt] = label[r.status] || ['t-block', r.status||''];
+        const note = r.reason ? esc(r.reason) + (r.revisitWhen?` <em>(revisit when ${esc(r.revisitWhen)})</em>`:'')
+                   : (r.defect ? esc(r.defect) : '');
+        return `<tr><td><code>${esc(r.id)}</code><br>${esc(r.title||'')}</td>
+          <td><span class="tag ${cls}">${esc(txt)}</span></td>
+          <td>${esc(r.scenarios??'—')}</td><td>${esc(r.assertions??'—')}</td>
+          <td>${esc(r.classes||'—')}</td><td>${note}</td></tr>`;
+      }).join('') + '</tbody></table></div>');
+  }
+
+  if (st.runs) {
+    P.push(`<h2>Suite reliability<span class="hint">a suite is only as trustworthy as its repeatability</span></h2>
+      <div class="panel pad">
+        <p style="margin:0 0 8px;font-size:14px">${esc(st.runs)} full runs · ${esc(st.cleanRuns ?? '—')} with no unexpected result${st.rate?` · instability observed in roughly ${esc(st.rate)}`:''}</p>
+        ${st.classification?`<p style="margin:0 0 8px;font-size:14px"><strong>Classified as ${esc(st.classification)}.</strong> ${esc(st.reasoning||'')}</p>`:''}
+        ${st.affected&&st.affected.length?`<p class="note">Affected: ${st.affected.map(esc).join(', ')}</p>`:''}
+        ${st.remediation?`<p class="note"><strong>Recommended fix:</strong> ${esc(st.remediation)}</p>`:''}
+        ${st.mutationScore?`<p class="note">Mutation check: ${esc(st.mutationScore)} — every passing test was re-run with its primary assertion inverted, to confirm it is capable of failing.</p>`:''}
+      </div>`);
+  }
+
+  const tests = d.tests||[];
+  if (tests.length) {
+    P.push(`<h2>Test catalogue<span class="hint">every row can be executed by hand</span></h2>
+      <div class="controls">
+        <button data-f="all" aria-pressed="true">All</button>
+        <button data-f="manual" aria-pressed="false">Manually executable</button>
+        <button data-f="failing" aria-pressed="false">Known defects</button>
+        <button data-f="unstable" aria-pressed="false">Unstable</button>
+      </div>
+      <div class="panel"><table><thead><tr><th>ID</th><th>What it verifies</th><th>Data</th>
+        <th>Expected</th><th>Requirement</th><th>Runs</th></tr></thead><tbody id="tbody"></tbody></table></div>`);
+  }
+
+  if (pf.operations || pf.thresholds) {
+    P.push(`<h2>Performance<span class="hint">${esc(pf.profile||'')}</span></h2>`);
+    if (pf.conditions) P.push(`<p class="note">${esc(pf.conditions)}</p>`);
+    if ((pf.operations||[]).length) {
+      P.push('<div class="panel"><table><thead><tr><th>Operation</th><th>p50</th><th>p95</th>' +
+        '<th>p99</th><th>Throughput</th><th>Errors</th><th>vs baseline</th></tr></thead><tbody>' +
+        pf.operations.map(o => {
+          const d95 = o.deltaP95 || '';
+          const worse = /^\+/.test(d95) && parseFloat(d95) > 10;
+          return `<tr><td>${esc(o.name)}</td><td>${esc(o.p50||'—')}</td>
+            <td>${esc(o.p95||'—')}</td><td>${esc(o.p99||'—')}</td>
+            <td>${esc(o.throughput||'—')}</td><td>${esc(o.errorRate||'—')}</td>
+            <td>${d95 ? `<span class="tag ${worse?'t-fail':'t-pass'}">${esc(d95)}</span>` : '—'}</td></tr>`;
+        }).join('') + '</tbody></table></div>');
+    }
+    if ((pf.thresholds||[]).length) {
+      P.push('<div class="panel" style="margin-top:10px"><table><thead><tr><th>Threshold</th>' +
+        '<th>Target</th><th>Actual</th><th>Result</th><th>Source</th></tr></thead><tbody>' +
+        pf.thresholds.map(t => `<tr><td>${esc(t.name)}</td><td>${esc(t.target)}</td>
+          <td>${esc(t.actual)}</td>
+          <td><span class="tag ${t.passed?'t-pass':'t-fail'}">${t.passed?'met':'breached'}</span></td>
+          <td>${esc(t.source||'—')}</td></tr>`).join('') + '</tbody></table></div>');
+    }
+    if (pf.saturation) P.push(`<p class="note"><strong>Saturation:</strong> ${esc(pf.saturation)}</p>`);
+    if (pf.doesNotEstablish) P.push(`<p class="note"><strong>This run does not establish:</strong> ${esc(pf.doesNotEstablish)}</p>`);
+  }
+
+  if ((sec.findings||[]).length || sec.scope) {
+    P.push('<h2>Security<span class="hint">QA security testing, not a penetration test</span></h2>');
+    if (sec.scope) P.push(`<div class="panel pad" style="margin-bottom:10px"><p style="margin:0;font-size:14px">${esc(sec.scope)}</p></div>`);
+    const sc2 = sec.counts||{};
+    const sv = [['critical',sc2.critical],['high',sc2.high],['medium',sc2.medium],['low',sc2.low]].filter(x=>x[1]);
+    if (sv.length) P.push('<p class="note">Findings: ' + sv.map(([k,n])=>`<strong>${esc(n)} ${k}</strong>`).join(' · ') + '</p>');
+    const order = { critical:0, high:1, medium:2, low:3 };
+    (sec.findings||[]).slice().sort((a,b)=>(order[a.severity]??9)-(order[b.severity]??9)).forEach(f =>
+      P.push(`<div class="defect${(f.severity==='critical'||f.severity==='high')?' silent':''}">
+        <h3>${esc(f.id)} — ${esc(f.title)}</h3>
+        <div class="meta">${esc(f.severity||'')}${f.category?' · '+esc(f.category):''}${f.surface?' · '+esc(f.surface):''}</div>
+        ${f.impact?`<p><strong>Impact:</strong> ${esc(f.impact)}</p>`:''}
+        ${f.fix?`<p><strong>Fix:</strong> ${esc(f.fix)}</p>`:''}
+        ${f.evidence?`<div class="callout">Evidence: ${esc(f.evidence)}</div>`:''}
+      </div>`));
+    if ((sec.notTested||[]).length) P.push('<p class="note"><strong>Not tested:</strong> ' +
+      sec.notTested.map(esc).join(' · ') + '</p>');
+    if ((sec.tooling||[]).length) P.push('<p class="note">Tooling: ' + sec.tooling.map(esc).join(' · ') + '</p>');
+  }
+
+  const qs = d.openQuestions||[];
+  if (qs.length) P.push('<h2>Awaiting decision</h2><div class="panel"><table><thead><tr>' +
+    '<th>ID</th><th>Question</th><th>Blocks</th><th>Proposed default</th></tr></thead><tbody>' +
+    qs.map(q=>`<tr><td><code>${esc(q.id)}</code></td><td>${esc(q.text)}</td>
+      <td>${(q.blocks||[]).map(esc).join(', ')||'—'}</td><td>${esc(q.proposed||'—')}</td></tr>`).join('') +
+    '</tbody></table></div>');
+
+  if ((d.recommendations||[]).length) P.push('<h2>Recommended next actions</h2><div class="panel pad"><ul class="plain">' +
+    d.recommendations.map(r => `<li>${esc(r)}</li>`).join('') + '</ul></div>');
+
+  if ((d.limitations||[]).length) P.push('<h2>Limitations<span class="hint">conditions a reader needs in order to weigh these results</span></h2><div class="panel pad"><ul class="plain">' +
+    d.limitations.map(l => `<li>${esc(l)}</li>`).join('') + '</ul></div>');
+
+  const env = [['Host', m.host && m.host + (m.hostNote?` (${m.hostNote})`:'')],
+    ['Contract version', m.contract], ['Dataset at time of run', m.dataset],
+    ['Runtime', m.runtime], ['Test data cleanup', m.cleanup]].filter(r=>r[1]);
+  if (env.length) P.push('<h2>Environment</h2><div class="panel"><table><tbody>' +
+    env.map(([k,val])=>`<tr><td style="width:190px;color:var(--muted)">${k}</td><td>${esc(val)}</td></tr>`).join('') +
+    '</tbody></table></div>');
+
+  if (m.preparedBy || m.reviewedBy) P.push(`<h2>Prepared by</h2><div class="panel pad signoff">
+    ${m.preparedBy?`<div><span>Prepared by</span>${esc(m.preparedBy)}</div>`:''}
+    ${m.reviewedBy?`<div><span>Reviewed by</span>${esc(m.reviewedBy)}</div>`:''}
+    ${m.reportDate?`<div><span>Date</span>${esc(m.reportDate)}</div>`:''}
+    ${m.reportVersion?`<div><span>Report version</span>${esc(m.reportVersion)}</div>`:''}
+  </div>`);
+
+  P.push('<footer>Generated automatically from the test suite and its scenarios. Self-contained — no network access required.</footer>');
+  document.getElementById('app').innerHTML = P.join('');
+
+  const tb = document.getElementById('tbody');
+  if (tb) {
+    const dot = r => `<i class="${r==='pass'?'r-pass':r==='fail'?'r-fail':'r-skip'}"></i>`;
+    const unstable = t => { const r=t.runs||[]; return r.length>1 && new Set(r).size>1; };
+    const render = f => {
+      const rows = tests.filter(t => f==='manual'?t.manual : f==='failing'?t.expectedToFail :
+        f==='unstable'?unstable(t) : true);
+      tb.innerHTML = rows.length ? rows.map(t=>`<tr>
+        <td><code>${esc(t.id)}</code>${t.expectedToFail?'<br><span class="tag t-known">by design</span>':''}</td>
+        <td>${esc(t.name)}${t.defect?`<br><span class="tag t-fail">${esc(t.defect)}</span>`:''}</td>
+        <td>${esc(t.data||'—')}</td><td>${esc(t.expected||'—')}</td>
+        <td><code>${esc(t.requirement||'—')}</code></td>
+        <td><span class="runs">${(t.runs||[]).map(dot).join('')}</span></td></tr>`).join('')
+        : '<tr><td colspan="6" class="empty">Nothing matches this filter.</td></tr>';
+    };
+    render('all');
+    document.querySelectorAll('[data-f]').forEach(b => b.addEventListener('click', ()=>{
+      document.querySelectorAll('[data-f]').forEach(x=>x.setAttribute('aria-pressed','false'));
+      b.setAttribute('aria-pressed','true'); render(b.dataset.f);
+    }));
+  }
+})();
+</script>
+</body>
+</html>
