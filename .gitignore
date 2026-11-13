@@ -1,0 +1,14 @@
+# Never commit secrets or machine state. Project settings and tokens live in
+# ~/.qa-agent/projects/<project>/, outside this repository.
+.env
+.env.*
+*.env
+secrets*
+*.pem
+*.key
+.DS_Store
+.toolkit-managed
+node_modules/
+__pycache__/
+*.pyc
+build/
