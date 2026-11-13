@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""qa-pipeline — keep 02-analysis/<TICKET>/_pipeline.json and answer "where are we?".
+
+  qa-pipeline set <TICKET> <STAGE> <pending|running|passed|failed|skipped|blocked>
+                  [--note TEXT] [--deferred-on TEXT] [--artefacts a,b] [--mode MODE]
+        Record a stage's state. `passed` is refused unless `qa-gate check-stage <TICKET>
+        <STAGE> --require-passed` accepts the gate file. startedAt / finishedAt are filled in.
+        A generator or script that produced a stage's artefacts records `running` with a
+        note; the stage agent in mode `verify` does the self-check and the rest.
+  qa-pipeline status [<TICKET>|all] [--json]
+        Every stage by track (automated, manual, release, delivery), with the gate file's
+        status and counts, critic disagreements, and everything waiting on the engineer.
+
+STAGE is a skill name (the gate file is _gates/<STAGE>.json). Options: --root DIR.
+Exit: 0 done · 1 refused (gate not accepted, invalid file) · 2 usage error.
+"""
+import argparse, json, os, subprocess, sys
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import qa_events  # noqa: E402
+import qa_schema  # noqa: E402
+
+QA_GATE = Path(os.path.realpath(__file__)).parent / "qa-gate"
+TRACKS = [
+    ("automated", ["ticket-fetch", "requirements-decomposer", "scenarios-generator", "figma-analyzer",
+                   "selectors-collector", "automation-api", "automation-ui", "test-debugger",
+                   "automation-compare", "scenario-data-fix", "discrepancies-fix"]),
+    ("manual", ["manual-test-cases", "test-execution", "exploratory-testing"]),
+    ("release", ["test-report", "qa-metrics", "contract-testing", "performance-testing", "security-testing"]),
+    ("delivery", ["tms-uploader", "pr-creator"]),
+]
+MARK = {"passed": "✓", "failed": "✗", "blocked": "⏸", "running": "⋯", "pending": "·", "skipped": "–",
+        "partial": "◐", "recorded": "○"}
+TERMINAL = {"passed", "failed", "skipped", "blocked"}
+
+
+def load(path, default=None):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return default
+
+
+def pipeline_path(root, ticket):
+    return root / "02-analysis" / ticket / "_pipeline.json"
+
+
+def cmd_set(root, a):
+    if not (root / "02-analysis" / a.ticket).is_dir():
+        print(f"qa-pipeline: no 02-analysis/{a.ticket}", file=sys.stderr)
+        return 2
+    if a.status == "passed":
+        r = subprocess.run([sys.executable, str(QA_GATE), "check-stage", a.ticket, a.stage, "--require-passed",
+                            "--root", str(root)], capture_output=True, text=True)
+        if r.returncode:
+            print(f"qa-pipeline: refused — {a.stage} is not accepted by check-stage --require-passed:", file=sys.stderr)
+            print("\n".join(l for l in r.stdout.splitlines() if l.startswith("✗")), file=sys.stderr)
+            return 1
+    pf = pipeline_path(root, a.ticket)
+    doc = load(pf, None) or {"ticket": a.ticket, "stages": {}}
+    now = qa_events.now()
+    st = doc.setdefault("stages", {}).setdefault(a.stage, {})
+    st["status"] = a.status
+    if a.status == "running" and not st.get("startedAt"):
+        st["startedAt"] = now
+    if a.status in TERMINAL:
+        st["finishedAt"] = now
+    gf = root / "02-analysis" / a.ticket / "_gates" / f"{a.stage}.json"
+    if gf.exists():
+        st["gateFile"] = str(gf.relative_to(root))
+    for key, val in (("note", a.note), ("deferredOn", a.deferred_on)):
+        if val is not None:
+            st[key] = val
+    if a.artefacts:
+        st["artefacts"] = [x for x in a.artefacts.split(",") if x]
+    if a.mode:
+        doc["mode"] = a.mode
+    doc["updatedAt"] = now
+    errs = qa_schema.validate(doc, qa_schema.load("pipeline"))
+    if errs:
+        print("qa-pipeline: refused — " + "; ".join(errs[:5]), file=sys.stderr)
+        return 1
+    tmp = pf.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp.replace(pf)
+    print(f"{a.ticket} {a.stage}: {a.status}")
+    return 0
+
+
+def stage_view(root, ticket, stage, st):
+    gdir = root / "02-analysis" / ticket / "_gates"
+    gate = load(gdir / f"{stage}.json", {}) or {}
+    critic = load(gdir / f"{stage}.critic.json", None)
+    counts = gate.get("counts") or {}
+    return {"stage": stage, "status": (st or {}).get("status") or ("recorded" if gate else "pending"),
+            "gateStatus": gate.get("status"), "counts": {k: v for k, v in list(counts.items())[:4]},
+            "note": (st or {}).get("note") or (st or {}).get("deferredOn"),
+            "critic": None if critic is None else {"verdict": critic.get("verdict"),
+                                                   "disagreements": sum(1 for d in critic.get("disagreements") or []
+                                                                        if not d.get("resolution")),
+                                                   "independence": critic.get("independence")},
+            "needsEngineer": [q.get("question") if isinstance(q, dict) else str(q) for q in gate.get("needsEngineer") or []]
+                             + [f"critic {d.get('id')}: {d.get('question')}" for d in (critic or {}).get("disagreements") or []
+                                if isinstance(d, dict) and not d.get("resolution")
+                                and not any(isinstance(q, dict) and q.get("critic") == d.get("id")
+                                            for q in gate.get("needsEngineer") or [])]}
+
+
+def ticket_status(root, ticket):
+    doc = load(pipeline_path(root, ticket), {}) or {}
+    stages = doc.get("stages") or {}
+    gates = {p.stem for p in (root / "02-analysis" / ticket / "_gates").glob("*.json") if not p.stem.endswith(".critic")}
+    out = {"ticket": ticket, "mode": doc.get("mode"), "updatedAt": doc.get("updatedAt"), "tracks": {}}
+    known = set()
+    for track, names in TRACKS:
+        rows = [stage_view(root, ticket, s, stages.get(s)) for s in names if s in stages or s in gates]
+        known |= set(names)
+        if rows:
+            out["tracks"][track] = rows
+    other = sorted((set(stages) | gates) - known)
+    if other:
+        out["tracks"]["other"] = [stage_view(root, ticket, s, stages.get(s)) for s in other]
+    return out
+
+
+def print_status(s):
+    rows = [r for rs in s["tracks"].values() for r in rs]
+    done = sum(r["status"] == "passed" for r in rows)
+    print(f"{s['ticket']} — {done} of {len(rows)} stages passed" + (f" · mode {s['mode']}" if s["mode"] else "")
+          + (f" · updated {s['updatedAt'][:16]}" if s["updatedAt"] else ""))
+    needs = []
+    for track, rs in s["tracks"].items():
+        print(f"  {track}")
+        for r in rs:
+            counts = " · ".join(f"{k} {v}" for k, v in r["counts"].items())
+            critic = ""
+            if r["critic"]:
+                critic = f" · critic {r['critic']['verdict']}, {r['critic']['disagreements']} open disagreement(s)"
+            gate = f" (gate file: {r['gateStatus']})" if r["gateStatus"] and r["gateStatus"] != r["status"] else ""
+            print(f"    {MARK.get(r['status'], '?')} {r['stage']:<24} {r['status']}{gate}"
+                  + (f" · {counts}" if counts else "") + critic + (f" · {r['note']}" if r["note"] else ""))
+            needs += [f"{r['stage']}: {q}" for q in r["needsEngineer"]]
+    print("  Needs you: " + ("none" if not needs else ""))
+    for q in needs:
+        print(f"    - {q}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("cmd", choices=["set", "status"])
+    ap.add_argument("ticket", nargs="?", default="all")
+    ap.add_argument("stage", nargs="?")
+    ap.add_argument("status", nargs="?", choices=["pending", "running", "passed", "failed", "skipped", "blocked"])
+    ap.add_argument("--note")
+    ap.add_argument("--deferred-on")
+    ap.add_argument("--artefacts")
+    ap.add_argument("--mode", choices=["pipeline", "parallel_types", "single_skill", "batch_issues", "resume",
+                                       "degraded", "verify"])
+    ap.add_argument("--root")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+    root = Path(a.root).resolve() if a.root else qa_events.find_root(os.getcwd())
+    if not root:
+        print("qa-pipeline: no .qa-project above $PWD; pass --root", file=sys.stderr)
+        return 2
+    if a.cmd == "set":
+        if not (a.ticket and a.stage and a.status) or a.ticket == "all":
+            print("qa-pipeline set <TICKET> <STAGE> <status>", file=sys.stderr)
+            return 2
+        return cmd_set(root, a)
+    tickets = sorted(p.parent.name for p in (root / "02-analysis").glob("*/_pipeline.json")) if a.ticket == "all" else [a.ticket]
+    result = [ticket_status(root, t) for t in tickets]
+    if a.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        for s in result:
+            print_status(s)
+        if not result:
+            print("no _pipeline.json yet")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

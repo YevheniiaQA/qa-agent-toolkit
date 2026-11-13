@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""qa-event — record a metric event in 05-metrics/events.jsonl, from a file, never from memory.
+
+  qa-event run <playwright.json>... [--suite S]    one event per Playwright JSON report: tests,
+                                                   passed, expected failures, unexpected, flaky,
+                                                   skipped, duration, and each test that was not
+                                                   as expected. Suite defaults to the folder
+                                                   under 03-tests (03-tests/ui/web -> ui-web).
+  qa-event mutation --suite S (--source F | --mutants N --killed K)
+                                                   a mutation pass; F is JSON with mutants, killed
+  qa-event triage <TEST> --class product-defect|test-bug|environment|data [--defect D] [--suite S]
+                                                   how an unexpected failure was classified
+  qa-event defect <ID> --state open|fixed|verified|closed|rejected|reopened [--severity S] [--phase P]
+                 [--customer-impact] [--regression]
+                                                   a defect changed state (bugs/<ID>.md holds the rest)
+  qa-event incident <ID> --state open|resolved [--severity S] [--customer-impact]
+                                                   a production incident started or was resolved
+  qa-event release <VERSION> [--rollback] [--hotfixes N]
+                                                   a release shipped (or, later, its rollback / hotfixes)
+  qa-event decision <Q-ID> --by engineer|default [--answer TEXT]
+                                                   an open question was settled, by the engineer or
+                                                   by applying its proposed default without an answer
+  qa-event session <session.md>                    an exploratory session (SBTM): duration and the
+                                                   setup / test / bug time split from its sheet
+  qa-event counts <STAGE> key=value... [--source F]   numbers a skill reports, read from F
+  qa-event migrate                                 copy older 05-metrics/*.jsonl lines and existing
+                                                   Playwright reports under 03-tests into events;
+                                                   the old files are kept; safe to re-run
+  qa-event list [--kind K] [-n N]                  the last events
+  qa-event recompute-durations                     stage events recorded with wall-clock duration (before
+                                                   active time): a correction line with durationS from the
+                                                   agent's transcript, up to the event; safe to re-run
+
+Options: --root DIR (default: the .qa-project above $PWD), --ticket T, --note TEXT,
+--source FILE (the file the fact comes from), --at YYYY-MM-DD[THH:MM] (when it happened, if not now).
+Exit: 0 written (or already recorded) · 1 invalid event · 2 usage error.
+"""
+import argparse, datetime, json, os, re, sys
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import qa_events  # noqa: E402
+
+TEST_ID = re.compile(r"^([A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+)\b")
+
+
+def walk_specs(suite):
+    for sp in suite.get("specs", []):
+        yield sp
+    for child in suite.get("suites", []):
+        yield from walk_specs(child)
+
+
+def suite_name(root, path):
+    p = Path(path).resolve()
+    try:
+        rel = p.relative_to(root / "03-tests").parts
+    except ValueError:
+        return None
+    parts = [x for x in rel[:-1] if x not in ("results", "test-results", "reports")]
+    return "-".join(parts) or None
+
+
+def run_event(root, path, suite=None):
+    doc = json.loads(Path(path).read_text(encoding="utf-8"))
+    stats = doc.get("stats") or {}
+    counts = dict(tests=0, passed=0, expectedFail=0, unexpected=0, flaky=0, skipped=0)
+    outcomes = {}
+    for top in doc.get("suites", []):
+        for spec in walk_specs(top):
+            m = TEST_ID.match(spec.get("title", ""))
+            tid = m.group(1) if m else f"{spec.get('file')}::{spec.get('title')}"
+            for t in spec.get("tests", []):
+                counts["tests"] += 1
+                st = t.get("status")          # expected | unexpected | flaky | skipped
+                if st == "expected":
+                    counts["expectedFail" if t.get("expectedStatus") == "failed" else "passed"] += 1
+                elif st in counts:
+                    counts[st] += 1
+                if st != "expected":
+                    outcomes[tid] = st
+    rel = str(Path(path).resolve().relative_to(root)) if str(Path(path).resolve()).startswith(str(root)) else str(path)
+    return dict(kind="run", suite=suite or suite_name(root, path) or "default", runs=1, **counts,
+                outcomes=outcomes or None, durationS=round((stats.get("duration") or 0) / 1000, 2),
+                ts=stats.get("startTime"), source=rel, sourceSha=qa_events.sha256(path))
+
+
+def already(events, key, value):
+    return any(ev.get(key) == value for ev in events)
+
+
+def write(root, ev, events=None):
+    # the same report, session sheet or legacy line is recorded once
+    if events is not None and any(ev.get(k) and already(events, k, ev[k]) for k in ("sourceSha", "migratedFrom")):
+        print(f"already recorded: {ev.get('source')}")
+        return None
+    try:
+        out = qa_events.append(root, ev)
+    except ValueError as e:
+        print(f"qa-event: invalid event: {e}", file=sys.stderr)
+        sys.exit(1)
+    if events is not None:
+        events.append(out)
+    print(f"recorded {out['kind']}" + (f" {out.get('suite') or out.get('stage') or out.get('id') or ''}").rstrip()
+          + (f" from {out['source']}" if out.get("source") else ""))
+    return out
+
+
+def migrate(root, events):
+    n = 0
+    for f in sorted((root / "05-metrics").glob("*.jsonl")):
+        if f.name == qa_events.EVENTS.name:
+            continue
+        for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                print(f"skipped {f.name}:{i}: not JSON")
+                continue
+            stage = rec.get("skill") or {"api-runs": "test-run", "ui-runs": "test-run",
+                                         "perf-history": "performance-testing"}.get(f.stem, f.stem)
+            ev = dict(kind="counts", stage=stage, suite=rec.get("suite") or rec.get("target"),
+                      counts={k: v for k, v in rec.items() if k not in ("date", "skill", "note")},
+                      ts=(rec.get("date") + "T00:00:00") if re.match(r"\d{4}-\d{2}-\d{2}$", str(rec.get("date"))) else None,
+                      note=rec.get("note"), source=f"05-metrics/{f.name}", migratedFrom=f"05-metrics/{f.name}:{i}")
+            n += bool(write(root, ev, events))
+    for f in sorted((root / "03-tests").rglob("*.json")) if (root / "03-tests").is_dir() else []:
+        if "node_modules" in f.parts:
+            continue
+        try:
+            doc = json.loads(f.read_text(encoding="utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if isinstance(doc, dict) and "stats" in doc and "suites" in doc and "config" in doc:
+            ev = run_event(root, f)
+            ev["migratedFrom"] = ev["source"]
+            n += bool(write(root, ev, events))
+    print(f"migrate: {n} new events; the original files are unchanged")
+
+
+def recompute_durations(root, events):
+    found = n = 0
+    for ev in [e for e in events if e.get("kind") == "stage" and e.get("runId") and e.get("durationS") is not None]:
+        paths = list(Path.home().glob(f".claude/projects/*/*/subagents/agent-{ev['runId']}.jsonl"))
+        if not paths:
+            continue
+        found += 1
+        until = qa_events._ts(ev.get("corrects") or ev["ts"])      # a correction stands for the event it replaced
+        usage = qa_events.transcript_usage(str(paths[0]), until=until) or {}
+        new = usage.get("durationS")
+        if new is None or abs(new - ev["durationS"]) <= 60:
+            continue
+        fix = {k: v for k, v in ev.items() if k not in ("ts", "project", "corrects")}
+        fix.update(durationS=new, corrects=ev.get("corrects") or ev["ts"],
+                   note=f"durationS recomputed as active time (gaps over {qa_events.IDLE_GAP_S}s left out); was {ev['durationS']}")
+        write(root, fix)
+        n += 1
+    print(f"recompute-durations: {n} corrected of {found} stage events with a transcript")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("cmd", choices=["run", "mutation", "triage", "defect", "incident", "release", "decision", "session",
+                                    "counts", "migrate", "list", "recompute-durations"])
+    ap.add_argument("args", nargs="*")
+    ap.add_argument("--root")
+    ap.add_argument("--ticket")
+    ap.add_argument("--note")
+    ap.add_argument("--suite")
+    ap.add_argument("--source")
+    ap.add_argument("--mutants", type=int)
+    ap.add_argument("--killed", type=int)
+    ap.add_argument("--class", dest="cls", choices=["product-defect", "test-bug", "environment", "data"])
+    ap.add_argument("--defect")
+    ap.add_argument("--state", choices=["open", "fixed", "verified", "closed", "rejected", "reopened", "resolved"])
+    ap.add_argument("--customer-impact", action="store_true")
+    ap.add_argument("--regression", action="store_true")
+    ap.add_argument("--rollback", action="store_true")
+    ap.add_argument("--hotfixes", type=int)
+    ap.add_argument("--at", help="when it happened (YYYY-MM-DD or YYYY-MM-DDTHH:MM), default now")
+    ap.add_argument("--severity")
+    ap.add_argument("--phase", choices=["requirements", "design", "automation", "manual", "exploratory", "production"])
+    ap.add_argument("--by", choices=["engineer", "default"])
+    ap.add_argument("--answer")
+    ap.add_argument("--kind")
+    ap.add_argument("-n", type=int, default=20)
+    a = ap.parse_args()
+
+    root = Path(a.root).resolve() if a.root else qa_events.find_root(os.getcwd())
+    if not root:
+        print("qa-event: no .qa-project above $PWD; pass --root", file=sys.stderr)
+        return 2
+    events, _ = qa_events.read(root)
+    common = dict(ticket=a.ticket, note=a.note)
+    when = {}
+    if a.at:
+        if not re.match(r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2})?$", a.at):
+            print("qa-event: --at YYYY-MM-DD or YYYY-MM-DDTHH:MM", file=sys.stderr)
+            return 2
+        when = {"ts": a.at if "T" in a.at else a.at + "T00:00:00"}
+
+    if a.cmd == "list":
+        sel = [e for e in events if not a.kind or e.get("kind") == a.kind][-a.n:]
+        for e in sel:
+            print(json.dumps(e, ensure_ascii=False)[:300])
+        return 0
+    if a.cmd == "migrate":
+        migrate(root, events)
+        return 0
+    if a.cmd == "recompute-durations":
+        recompute_durations(root, events)
+        return 0
+    if a.cmd == "run":
+        if not a.args:
+            print("qa-event run <playwright.json>...", file=sys.stderr)
+            return 2
+        for f in a.args:
+            write(root, dict(run_event(root, f, a.suite), **common), events)
+        return 0
+    if a.cmd == "mutation":
+        mutants, killed = a.mutants, a.killed
+        if a.source:
+            doc = json.loads(Path(a.source).read_text(encoding="utf-8"))
+            mutants, killed = doc.get("mutants", mutants), doc.get("killed", killed)
+        if not a.suite or mutants is None or killed is None:
+            print("qa-event mutation --suite S (--source F | --mutants N --killed K)", file=sys.stderr)
+            return 2
+        write(root, dict(kind="mutation", suite=a.suite, mutants=mutants, killed=killed, source=a.source, **common))
+        return 0
+    if a.cmd == "triage":
+        if len(a.args) != 1 or not a.cls:
+            print("qa-event triage <TEST> --class C", file=sys.stderr)
+            return 2
+        write(root, dict(kind="triage", test=a.args[0], **{"class": a.cls}, id=a.defect, suite=a.suite, source=a.source, **common))
+        return 0
+    if a.cmd == "defect":
+        if len(a.args) != 1 or not a.state:
+            print("qa-event defect <ID> --state S", file=sys.stderr)
+            return 2
+        if a.state == "resolved":
+            print("qa-event defect: 'resolved' is an incident state; a defect is fixed / verified / closed", file=sys.stderr)
+            return 2
+        write(root, dict(kind="defect", id=a.args[0], state=a.state, severity=a.severity, phase=a.phase,
+                         customerImpact=a.customer_impact or None, regression=a.regression or None,
+                         source=a.source, **when, **common))
+        return 0
+    if a.cmd == "incident":
+        if len(a.args) != 1 or a.state not in ("open", "resolved"):
+            print("qa-event incident <ID> --state open|resolved", file=sys.stderr)
+            return 2
+        write(root, dict(kind="incident", id=a.args[0], state=a.state, severity=a.severity,
+                         customerImpact=a.customer_impact or None, source=a.source, **when, **common))
+        return 0
+    if a.cmd == "release":
+        if len(a.args) != 1:
+            print("qa-event release <VERSION> [--rollback] [--hotfixes N]", file=sys.stderr)
+            return 2
+        write(root, dict(kind="release", version=a.args[0], rollback=a.rollback, hotfixes=a.hotfixes,
+                         source=a.source, **when, **common))
+        return 0
+    if a.cmd == "decision":
+        if len(a.args) != 1 or not a.by:
+            print("qa-event decision <Q-ID> --by engineer|default", file=sys.stderr)
+            return 2
+        write(root, dict(kind="decision", id=a.args[0], by=a.by, answer=a.answer, **common))
+        return 0
+    if a.cmd == "session":
+        for f in a.args:
+            try:
+                ev = qa_events.parse_session(f)
+            except (OSError, ValueError) as e:
+                print(f"qa-event session {f}: {e}", file=sys.stderr)
+                return 1
+            p = Path(f).resolve()
+            ev["source"] = str(p.relative_to(root)) if str(p).startswith(str(root)) else str(p)
+            write(root, dict(ev, sourceSha=qa_events.sha256(f), **common), events)
+        return 0
+    if a.cmd == "counts":
+        if len(a.args) < 2 or not all("=" in x for x in a.args[1:]):
+            print("qa-event counts <STAGE> key=value...", file=sys.stderr)
+            return 2
+        vals = {}
+        for kv in a.args[1:]:
+            k, v = kv.split("=", 1)
+            try:
+                vals[k] = json.loads(v)
+            except ValueError:
+                vals[k] = v
+        write(root, dict(kind="counts", stage=a.args[0], counts=vals, suite=a.suite, source=a.source, **common))
+        return 0
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

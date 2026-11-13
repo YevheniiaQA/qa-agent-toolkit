@@ -1,0 +1,1017 @@
+#!/usr/bin/env python3
+"""qa-gate — mechanical quality-gate checks for the QA pipeline, with compact output.
+
+Covers only what a script can decide. Judgement gates from each skill's
+"Self-check before reporting completion" stay with the agent; the agent records
+both in the stage gate file.
+
+  qa-gate reqs      <TICKET>                      Gate 1 (requirements-decomposer)
+  qa-gate scenarios <TICKET>                      Gate 2 (scenarios-generator)
+  qa-gate code      <TEST_DIR> [--ui] [--run]     Gate 3 (automation-api / automation-ui)
+  qa-gate manual    <TICKET>                      Gate 2M (manual-test-cases): every AC has a case or a
+                                                  waiver, the CSV imports (BOM, columns), no credentials
+  qa-gate execution <TICKET>                      Gate E (test-execution): every case in the last round
+                                                  has a result, every unexpected failure has evidence
+  qa-gate report    <TICKET> [--file REPORT.html] Gate R (test-report): summary, per-test runs, stability
+                                                  and defects recomputed from the raw run reports
+
+  qa-gate schema    <NAME> <FILE>...              validate files against schemas/<NAME>.schema.json
+  qa-gate check-stage <TICKET> <STAGE> [--rerun] [--require-passed]
+                    the stage's gate file is complete and honest: schema, one selfCheck entry per
+                    item of the skill's self-check, status consistent with results, mechanical
+                    gate present; --rerun repeats the mechanical commands and compares exit codes.
+                    TICKET is `_project` for project-scoped stages.
+  qa-gate check-pipeline <TICKET|all> [--since MIN]
+                    every stage _pipeline.json marks `passed` has a gate file check-stage accepts
+                    with --require-passed; with --since, only pipelines and gate files changed in
+                    the last MIN minutes, and recent gate files must be complete even if not passed.
+
+Options (any subcommand):
+  --root DIR         workspace root (default: nearest dir above $PWD with .qa-project)
+  --write STAGE      also write the result to 02-analysis/<TICKET>/_gates/STAGE.json
+                     under "mechanical" (merged, other keys kept), and append a `gate` event to
+                     05-metrics/events.jsonl. Needs --ticket for `code`.
+  --ticket T         ticket for `code` (scenario count + gate file location)
+  --json             print the result as JSON instead of the table
+
+Exit: 0 all checks pass or skip · 1 at least one fails · 2 usage or input error.
+"""
+import argparse, csv, datetime, io, json, os, re, subprocess, sys, time
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import qa_schema  # noqa: E402 — lives beside this script
+import qa_events  # noqa: E402
+
+PASS, FAIL, SKIP, WARN = "pass", "fail", "skip", "warn"
+MAX_DETAIL = 5  # offenders listed per check; the rest is counted, not printed
+TOOLKIT = Path(os.path.realpath(__file__)).parent.parent
+SKILL_DIRS = [TOOLKIT / "skills", Path.home() / ".claude" / "skills", Path.home() / ".cursor" / "skills"]
+# stages whose skill has a mechanical gate: the "mechanical" key qa-gate --write records for them
+MECHANICAL = {"requirements-decomposer": "reqs", "scenarios-generator": "scenarios",
+              "automation-api": "code", "automation-ui": "code", "test-debugger": "code",
+              "manual-test-cases": "manual", "test-execution": "execution", "test-report": "report"}
+
+
+def find_root(start):
+    d = Path(start).resolve()
+    for p in [d, *d.parents]:
+        if (p / ".qa-project").exists():
+            return p
+    return None
+
+
+class Report:
+    def __init__(self, cmd):
+        self.cmd, self.checks = cmd, []
+
+    def add(self, cid, name, status, detail="", offenders=None):
+        offenders = offenders or []
+        if status == PASS and not offenders:
+            detail = ""
+        if offenders:
+            more = len(offenders) - MAX_DETAIL
+            shown = ", ".join(map(str, offenders[:MAX_DETAIL]))
+            detail = (detail + ": " if detail else "") + shown + (f" (+{more} more)" if more > 0 else "")
+        self.checks.append({"id": cid, "check": name, "result": status, "detail": detail})
+
+    @property
+    def failed(self):
+        return any(c["result"] == FAIL for c in self.checks)
+
+    def as_dict(self):
+        n = lambda r: sum(c["result"] == r for c in self.checks)
+        return {"tool": "qa-gate " + self.cmd, "ranAt": datetime.datetime.now().isoformat(timespec="seconds"),
+                "exitCode": 1 if self.failed else 0,
+                "summary": {"pass": n(PASS), "fail": n(FAIL), "warn": n(WARN), "skip": n(SKIP)},
+                "checks": self.checks}
+
+    def print_table(self):
+        mark = {PASS: "✓", FAIL: "✗", SKIP: "–", WARN: "!"}
+        for c in self.checks:
+            line = f"{mark[c['result']]} {c['id']:<4} {c['check']}"
+            print(line + (f" — {c['detail']}" if c["detail"] else ""))
+        s = self.as_dict()["summary"]
+        print(f"qa-gate {self.cmd}: {s['pass']} pass, {s['fail']} fail, {s['warn']} warn, {s['skip']} skip")
+
+
+def load_json(path, rep, cid, label):
+    try:
+        return json.loads(Path(path).read_text())
+    except FileNotFoundError:
+        rep.add(cid, f"{label} exists and is valid JSON", FAIL, f"missing: {path}")
+    except json.JSONDecodeError as e:
+        rep.add(cid, f"{label} exists and is valid JSON", FAIL, f"{path}: {e}")
+    return None
+
+
+# ---------------------------------------------------------------- Gate 1
+def gate_reqs(root, ticket, rep):
+    tdir = root / "02-analysis" / ticket
+    rdir = tdir / "requirements"
+    idx = load_json(rdir / "_index.json", rep, "R1", "requirements/_index.json")
+    if idx is None:
+        return
+    rep.add("R1", "requirements/_index.json exists and is valid JSON", PASS)
+    errs = qa_schema.validate(idx, qa_schema.load("requirements-index"))
+    rep.add("R17", "_index.json matches schemas/requirements-index", FAIL if errs else PASS, offenders=errs)
+
+    prov = [p.name for p in (tdir / "_fetch.json", rdir / "_fetch.json", tdir / "_source.json") if p.exists()]
+    rep.add("R2", "input provenance file (_fetch.json or _source.json)", PASS if prov else FAIL,
+            ", ".join(prov) if prov else "none found — input may be synthesised")
+
+    reqs = idx.get("requirements", [])
+    ids = [r.get("id", "") for r in reqs]
+    dup = sorted({i for i in ids if ids.count(i) > 1})
+    rep.add("R3", "requirement IDs unique", FAIL if dup else PASS, offenders=dup)
+
+    gaps = []
+    by_prefix = {}
+    for i in ids:
+        m = re.match(r"^(.*)-(\d+)$", i)
+        if m:
+            by_prefix.setdefault(m.group(1), []).append(int(m.group(2)))
+    for pfx, nums in by_prefix.items():
+        want = set(range(1, max(nums) + 1))
+        gaps += [f"{pfx}-{n:02d}" for n in sorted(want - set(nums))]
+    rep.add("R4", "requirement IDs contiguous per prefix", FAIL if gaps else PASS, "missing", gaps)
+
+    pat = re.compile(rf"^N?F-{re.escape(ticket)}-[A-Z0-9]+-\d+$")
+    bad = [i for i in ids if not pat.match(i)]
+    rep.add("R5", f"ID format N?F-{ticket}-<LAYER>-<NN>", FAIL if bad else PASS, offenders=bad)
+
+    nosrc = [r.get("id") for r in reqs if not str(r.get("source") or "").strip()]
+    rep.add("R6", "every requirement has a source", FAIL if nosrc else PASS, offenders=nosrc)
+
+    acs = idx.get("acceptanceCriteria", [])
+    incomplete = [a.get("id") for a in acs if not all(str(a.get(k) or "").strip() for k in ("given", "when", "then"))]
+    rep.add("R7", "every AC has Given/When/Then", FAIL if incomplete else PASS, offenders=incomplete)
+    compound = [a.get("id") for a in acs if re.search(r"\b(and|then)\b.*\b(and|then)\b|;", str(a.get("then", "")), re.I)]
+    rep.add("R8", "no compound Then (heuristic: 2+ 'and'/'then' or ';')", WARN if compound else PASS,
+            "review", compound)
+
+    stories = set(idx.get("stories", []))
+    no_ac = sorted(stories - {a.get("story") for a in acs})
+    rep.add("R9", "every User Story has at least one AC", FAIL if no_ac else PASS, offenders=no_ac)
+
+    idset = set(ids)
+    dangling = sorted({f"{a.get('id')}→{r}" for a in acs for r in a.get("requirements", []) if r not in idset})
+    rep.add("R10", "AC → requirement references resolve", FAIL if dangling else PASS, offenders=dangling)
+
+    qs = idx.get("openQuestions", [])
+    qids = {q.get("id") for q in qs}
+    nodefault = [q.get("id") for q in qs if not str(q.get("default") or "").strip()]
+    rep.add("R11", "every open question has a proposed default", FAIL if nodefault else PASS, offenders=nodefault)
+    cited = {q for r in reqs for q in (r.get("questions") or [])} | {q.get("id") for q in qs if q.get("blocks")}
+    orphan_q = sorted(qids - cited)
+    rep.add("R12", "every open question is cited by a requirement", FAIL if orphan_q else PASS, offenders=orphan_q)
+    unknown_q = sorted({q for r in reqs for q in (r.get("questions") or [])} - qids)
+    rep.add("R13", "requirement → question references resolve", FAIL if unknown_q else PASS, offenders=unknown_q)
+    unsourced = [r.get("id") for r in reqs if r.get("status") == "proposed" and not r.get("questions")
+                 and r.get("id") not in {b for q in qs for b in q.get("blocks", [])}]
+    rep.add("R14", "every 'proposed' requirement has a matching open question", FAIL if unsourced else PASS,
+            offenders=unsourced)
+
+    oq = rdir / "OPEN_QUESTIONS.md"
+    rep.add("R15", "OPEN_QUESTIONS.md exists", PASS if oq.exists() or not qs else FAIL,
+            "" if oq.exists() else ("no questions" if not qs else f"{len(qs)} questions, file missing"))
+    has_nfr = any(i.startswith("NF-") for i in ids) or "nfr" in json.dumps(idx).lower()
+    rep.add("R16", "NFRs present or explicitly marked N/A", PASS if has_nfr else FAIL)
+
+
+# ---------------------------------------------------------------- Gate 2
+PLACEHOLDER = re.compile(r"\b(TODO|TBD|FIXME|XXX)\b|<[^<>]*(placeholder|value)[^<>]*>|\{\{(?!GENERATED:|TEST_DATA:)[^}]*\}\}", re.I)
+NONTERMINAL = {"unprobed", "needs-verification", "draft", "investigating"}
+VAGUE = re.compile(r"^\s*(the )?(request|call|operation|it) (succeeds|works|is successful|fails)\.?\s*$", re.I)
+CREATES = re.compile(r"^\s*POST\b", re.I)
+SUCCESS = re.compile(r"\b(HTTP\s*)?2\d\d\b")
+
+
+def gate_scenarios(root, ticket, rep):
+    tdir = root / "02-analysis" / ticket
+    sdir = tdir / "scenarios"
+    suites = sorted(sdir.glob("*.json")) if sdir.exists() else []
+    if not suites:
+        rep.add("S1", "scenario suites exist", FAIL, f"no *.json in {sdir}")
+        return
+    idx = json.loads((tdir / "requirements" / "_index.json").read_text()) \
+        if (tdir / "requirements" / "_index.json").exists() else None
+
+    cases, waivers, bad_files, schema_errs = [], [], [], []
+    suite_schema = qa_schema.load("scenario-suite")
+    for f in suites:
+        try:
+            doc = json.loads(f.read_text())
+            schema_errs += [f"{f.name} {e}" for e in qa_schema.validate(doc, suite_schema)]
+            ts = doc["testSuite"]
+            cases += [(f.name, c) for c in ts.get("testCases", [])]
+            waivers += ts.get("nfrWaivers", [])
+        except Exception as e:  # noqa: BLE001 — any malformed suite is a gate failure
+            bad_files.append(f"{f.name}: {e.__class__.__name__}")
+    rep.add("S1", f"suites valid ({len(suites)} files, {len(cases)} scenarios)", FAIL if bad_files else PASS,
+            offenders=bad_files)
+    rep.add("S16", "suites match schemas/scenario-suite", FAIL if schema_errs else PASS, offenders=schema_errs)
+
+    req_fields = ("id", "name", "priority", "technique", "status", "testSteps", "traceability")
+    missing = [f"{c.get('id', '?')}:{k}" for _, c in cases for k in req_fields if not c.get(k)]
+    rep.add("S2", "required fields present (id, name, priority, technique, status, steps, traceability)",
+            FAIL if missing else PASS, offenders=missing)
+
+    ids = [c.get("id") for _, c in cases]
+    dup = sorted({i for i in ids if ids.count(i) > 1})
+    rep.add("S3", "scenario IDs unique", FAIL if dup else PASS, offenders=dup)
+
+    notrace = [c.get("id") for _, c in cases if not (c.get("traceability") or {}).get("requirementIds")]
+    rep.add("S4", "every scenario traces to ≥1 requirement", FAIL if notrace else PASS, offenders=notrace)
+
+    if idx:
+        known = {r["id"] for r in idx.get("requirements", [])}
+        dangling = sorted({f"{c.get('id')}→{r}" for _, c in cases
+                           for r in (c.get("traceability") or {}).get("requirementIds", []) if r not in known})
+        rep.add("S5", "scenario → requirement references resolve", FAIL if dangling else PASS, offenders=dangling)
+        covered = {r for _, c in cases for r in (c.get("traceability") or {}).get("requirementIds", [])}
+        waived = {w.get("requirementId") for w in waivers}
+        uncovered = sorted(known - covered - waived)
+        rep.add("S6", f"every requirement covered or waived in JSON ({len(known)} reqs)",
+                FAIL if uncovered else PASS, offenders=uncovered)
+        acs = {a["id"] for a in idx.get("acceptanceCriteria", [])}
+        ac_hit = {a for _, c in cases for a in (c.get("traceability") or {}).get("acceptanceCriteria", [])}
+        rep.add("S7", "every acceptance criterion reached by a scenario", FAIL if acs - ac_hit else PASS,
+                offenders=sorted(acs - ac_hit))
+        qids = {q["id"] for q in idx.get("openQuestions", [])}
+        badq = sorted({f"{w.get('requirementId')}→{w['blockedBy']}" for w in waivers
+                       if w.get("blockedBy") and w["blockedBy"] not in qids})
+        badq += sorted({f"{c.get('id')}→{c['blockedBy']}" for _, c in cases
+                        if c.get("blockedBy") and c["blockedBy"] not in qids})
+        rep.add("S8", "blockedBy references resolve to open questions", FAIL if badq else PASS, offenders=badq)
+    else:
+        rep.add("S5", "requirements/_index.json available for traceability checks", FAIL, "missing")
+
+    nonterm = [f"{c.get('id')}:{c.get('status')}" for _, c in cases if c.get("status") in NONTERMINAL]
+    rep.add("S9", "no scenario in a non-terminal status", FAIL if nonterm else PASS, offenders=nonterm)
+
+    badstep, vague, ph = [], [], []
+    for _, c in cases:
+        for s in c.get("testSteps") or []:
+            sid = f"{c.get('id')}#{s.get('stepNumber', '?')}"
+            if not str(s.get("action") or "").strip() or not str(s.get("expectedResult") or "").strip():
+                badstep.append(sid)
+            if VAGUE.match(str(s.get("expectedResult") or "")):
+                vague.append(sid)
+            if PLACEHOLDER.search(json.dumps(s)):
+                ph.append(sid)
+    rep.add("S10", "every step has action + expected result", FAIL if badstep else PASS, offenders=badstep)
+    rep.add("S11", "no vague expected result ('request succeeds')", FAIL if vague else PASS, offenders=vague)
+    rep.add("S12", "no unresolved placeholders ({{GENERATED:…}}/{{TEST_DATA:…}} allowed)", FAIL if ph else PASS, offenders=ph)
+
+    nocleanup = [c.get("id") for _, c in cases
+                 if any(CREATES.match(str(s.get("action") or "")) and SUCCESS.match(str(s.get("expectedResult") or ""))
+                        for s in c.get("testSteps") or [])
+                 and not c.get("cleanup")]
+    rep.add("S13", "scenarios that create data declare cleanup (POST expecting 2xx)",
+            FAIL if nocleanup else PASS, offenders=nocleanup)
+
+    notech = [c.get("id") for _, c in cases if not c.get("technique")]
+    rep.add("S14", "every scenario names its test design technique", FAIL if notech else PASS, offenders=notech)
+
+    rtm = sdir / "RTM.md"
+    if not rtm.exists():
+        rep.add("S15", "RTM.md exists and lists every requirement", FAIL, "RTM.md missing")
+    elif idx:
+        text = rtm.read_text()
+        absent = [r["id"] for r in idx.get("requirements", []) if r["id"] not in text]
+        rep.add("S15", "RTM.md exists and lists every requirement", FAIL if absent else PASS, offenders=absent)
+
+
+# ---------------------------------------------------------------- Gate 3
+SCEN_ID = re.compile(r"\bTC-[A-Z0-9]+(?:-[A-Z0-9]+)*-\d+\b")
+STRING_LIT = re.compile(r"""(['"`])((?:\\.|(?!\1).)*)\1""")
+LOCATOR_SMELLS = ((r"^\s*(xpath=)?/html", "absolute xpath"), (r"nth-child", "nth-child"),
+                  (r"\.(css|sc|jsx)-[a-zA-Z0-9]{5,}\b", "generated class"),
+                  (r"\.[A-Za-z][\w-]*__[A-Za-z0-9_-]{5}\b", "css-module hash"))
+TEST_CALL = re.compile(r"^\s*test(?:\.fail|\.fixme|\.skip|\.only)?\s*\(\s*(['\"`])(.+?)\1", re.M)
+
+
+def sh(cmd, cwd, timeout=600):
+    try:
+        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout + p.stderr
+    except FileNotFoundError as e:
+        return 127, str(e)
+    except subprocess.TimeoutExpired:
+        return 124, f"timeout after {timeout}s"
+
+
+def test_bodies(text):
+    """Yield (title, body) for each test(...) call, by brace matching. Heuristic: ignores braces in strings."""
+    for m in TEST_CALL.finditer(text):
+        arrow = text.find("=>", m.end())  # skip the destructured fixtures: async ({ page }) => {
+        i = text.find("{", arrow) if arrow >= 0 else -1
+        if i < 0:
+            continue
+        depth, j = 0, i
+        while j < len(text):
+            depth += {"{": 1, "}": -1}.get(text[j], 0)
+            if depth == 0:
+                break
+            j += 1
+        yield m.group(2), text[i:j]
+
+
+FUNC_DEF = re.compile(r"(?:function\s+(\w+)\s*\(|(?:const|let)\s+(\w+)\s*=\s*(?:async\s*)?(?:\([^)]*\)|\w+)\s*(?::[^=]+)?=>"
+                      r"|^\s*(?:async\s+)?(\w+)\s*\([^)]*\)\s*(?::[^{;]+)?\{)", re.M)
+
+
+def block_after(text, pos):
+    if text[pos:pos + 1] == "(":  # function f({ a, b }) {  — skip the parameter list first
+        depth = 0
+        while pos < len(text):
+            depth += {"(": 1, ")": -1}.get(text[pos], 0)
+            if depth == 0:
+                break
+            pos += 1
+    i = text.find("{", pos)
+    if i < 0:
+        return ""
+    depth, j = 0, i
+    while j < len(text):
+        depth += {"{": 1, "}": -1}.get(text[j], 0)
+        if depth == 0:
+            break
+        j += 1
+    return text[i:j]
+
+
+def asserting_helpers(files):
+    """Names of project functions/methods whose body asserts (directly or via another such helper)."""
+    defs = {}
+    for p in files:
+        t = p.read_text()
+        for m in FUNC_DEF.finditer(t):
+            name = next(g for g in m.groups() if g)
+            if name not in ("if", "for", "while", "switch", "catch", "test", "describe"):
+                defs[name] = defs.get(name, "") + block_after(t, m.end() - 1)
+    found = {n for n, b in defs.items() if "expect" in b}
+    while True:  # helpers that call asserting helpers also assert
+        more = {n for n, b in defs.items() if n not in found and any(re.search(rf"\b{h}\s*\(", b) for h in found)}
+        if not more:
+            return found
+        found |= more
+
+
+def gate_code(root, test_dir, ui, run, ticket, rep):
+    td = Path(test_dir).resolve()
+    if not (td / "package.json").exists():
+        rep.add("C0", "test project found", FAIL, f"no package.json in {td}")
+        return
+    specs = [p for p in td.rglob("*.spec.ts") if "node_modules" not in p.parts]
+    srcs = [p for p in td.rglob("*.ts") if "node_modules" not in p.parts]
+
+    code, out = sh(["npx", "--no-install", "tsc", "--noEmit"], td)
+    errs = [l.strip() for l in out.splitlines() if "error TS" in l]
+    rep.add("C1", "tsc --noEmit", PASS if code == 0 else FAIL, f"{len(errs)} errors" if errs else out.strip()[-200:]
+            if code else "", errs)
+
+    has_eslint = any((td / f).exists() for f in ("eslint.config.js", "eslint.config.mjs", "eslint.config.ts",
+                                                 ".eslintrc", ".eslintrc.js", ".eslintrc.json", ".eslintrc.cjs"))
+    if has_eslint:
+        code, out = sh(["npx", "--no-install", "eslint", ".", "--format", "unix"], td)
+        rep.add("C2", "eslint", PASS if code == 0 else FAIL, offenders=[l for l in out.splitlines() if ":" in l][:20])
+    else:
+        rep.add("C2", "eslint", SKIP, "no eslint config in project")
+
+    code, out = sh(["npx", "--no-install", "playwright", "test", "--list", "--reporter=list"], td)
+    listed = [l for l in out.splitlines() if "›" in l]
+    m = re.search(r"Total: (\d+) tests?", out)
+    total = int(m.group(1)) if m else len(listed)
+    rep.add("C3", f"playwright --list discovers tests ({total})", PASS if code == 0 and total else FAIL,
+            "" if code == 0 else out.strip()[-200:])
+
+    if ticket:
+        sfile = root / "02-analysis" / ticket / "scenarios" / ("ui.json" if ui else "api.json")
+        if sfile.exists():
+            sc = json.loads(sfile.read_text())["testSuite"]["testCases"]
+            want = {c["id"] for c in sc if c.get("status") != "undecided"}
+            got = {i for l in listed for i in SCEN_ID.findall(l)}
+            miss = sorted(want - got)
+            rep.add("C4", f"every non-undecided scenario in {sfile.name} has a test ({len(want)})",
+                    FAIL if miss else PASS, "missing", miss)
+            undecided = {c["id"] for c in sc if c.get("status") == "undecided"} & got
+            rep.add("C5", "no test generated for an 'undecided' scenario", FAIL if undecided else PASS,
+                    offenders=sorted(undecided))
+        else:
+            rep.add("C4", "scenario count matches tests", SKIP, f"{sfile} not found")
+
+    notitle = sorted({l.strip()[:80] for l in listed if not SCEN_ID.search(l)
+                      and "selectors.validate" not in l})
+    rep.add("C6", "every test title carries a scenario ID", FAIL if notitle else PASS, offenders=notitle)
+
+    helpers = asserting_helpers(srcs)
+    calls_helper = re.compile(r"\b(" + "|".join(map(re.escape, helpers)) + r")\s*\(") if helpers else None
+    only, waits, commented, noassert, retries = [], [], [], [], []
+    for p in specs:
+        t = p.read_text()
+        rel = p.relative_to(td)
+        only += [str(rel)] * len(re.findall(r"\b(test|describe)\.only\s*\(", t))
+        waits += [str(rel)] * len(re.findall(r"waitForTimeout\s*\(", t))
+        commented += [str(rel)] * len(re.findall(r"^\s*//\s*test(\.\w+)?\s*\(", t, re.M))
+        retries += [str(rel)] * len(re.findall(r"\b(test\.describe\.configure\(\s*\{[^}]*retries|retries\s*:)", t))
+        for title, body in test_bodies(t):
+            if "expect" not in body and not (calls_helper and calls_helper.search(body)):
+                noassert.append(f"{rel}: {title[:60]}")
+    rep.add("C7", "no test.only", FAIL if only else PASS, offenders=only)
+    rep.add("C8", "no waitForTimeout", FAIL if waits else PASS, offenders=waits)
+    rep.add("C9", "no commented-out tests", FAIL if commented else PASS, offenders=commented)
+    rep.add("C10", "every test asserts (expect, or a project helper that expects)", FAIL if noassert else PASS, offenders=noassert)
+    rep.add("C11", "no per-spec retries", WARN if retries else PASS, "review", retries)
+
+    url_hits = []
+    for p in srcs:
+        if p.name.startswith("playwright.config") or p.suffix != ".ts":
+            continue
+        for n, line in enumerate(p.read_text().splitlines(), 1):
+            if re.search(r"https?://", line) and not re.search(r"process\.env|^\s*(//|\*)", line):
+                url_hits.append(f"{p.relative_to(td)}:{n}")
+    rep.add("C12", "no hardcoded URLs outside config", FAIL if url_hits else PASS, offenders=url_hits)
+
+    tr = td / "TRACEABILITY.json"
+    if tr.exists():
+        try:
+            entries = json.loads(tr.read_text())
+            entries = entries if isinstance(entries, list) else entries.get("tests", [])
+            titles = "\n".join(listed)
+            unresolved = [e.get("scenarioId") or e.get("testTitle", "?")[:40] for e in entries
+                          if e.get("testTitle") and e["testTitle"] not in titles]
+            rep.add("C13", f"TRACEABILITY.json entries resolve to tests ({len(entries)})",
+                    FAIL if unresolved else PASS, offenders=unresolved)
+        except json.JSONDecodeError as e:
+            rep.add("C13", "TRACEABILITY.json valid", FAIL, str(e))
+    else:
+        rep.add("C13", "TRACEABILITY.json written", FAIL, "missing")
+    rep.add("C14", "TEST_CATALOGUE.md written", PASS if (td / "TEST_CATALOGUE.md").exists() else FAIL)
+
+    if ui:
+        bad = []
+        for p in srcs:
+            literals = [m.group(2) for m in STRING_LIT.finditer(p.read_text())]
+            for pat, label in LOCATOR_SMELLS:
+                hits = [x for x in literals if re.search(pat, x)]
+                if hits:
+                    bad.append(f"{p.relative_to(td)} ({label}: {hits[0][:40]})")
+        rep.add("C15", "no absolute XPath / nth-child / generated class locators", FAIL if bad else PASS,
+                offenders=bad)
+        cfg = "".join(p.read_text() for p in td.glob("playwright.config.*"))
+        rep.add("C16", "auth via storageState (config mentions storageState)",
+                PASS if "storageState" in cfg else SKIP, "" if "storageState" in cfg else "not referenced — fine if target has no auth")
+        nonweb = [f"{p.relative_to(td)}" for p in specs
+                  if re.search(r"expect\(\s*await\s+[^)]*\.(isVisible|textContent|innerText|isEnabled|count)\(", p.read_text())]
+        rep.add("C17", "web-first assertions (no expect(await locator.isVisible()))",
+                FAIL if nonweb else PASS, offenders=nonweb)
+
+    if run:
+        code, out = sh(["npx", "--no-install", "playwright", "test", "--reporter=line"], td, timeout=1800)
+        tail = [l for l in out.splitlines() if re.search(r"\d+ (passed|failed|flaky|skipped)", l)]
+        rep.add("C18", "suite run", PASS if code == 0 else FAIL, "; ".join(tail[-4:]) or out.strip()[-200:])
+    else:
+        rep.add("C18", "suite run", SKIP, "pass --run to execute (the skill's 3-run stability check stays with the agent)")
+
+
+# ---------------------------------------------------------------- Gate 2M — manual cases
+COL = {  # internal field -> column names used by the TMS shapes in manual-test-cases/formats.md
+    "id": ("ID", "Custom_external_id", "Id", "Issue Key"),
+    "title": ("Title", "Name", "Summary"),
+    "priority": ("Priority",),
+    "refs": ("References", "Requirement", "Issues"),
+    "expected": ("Expected Result", "Test Step Expected Result", "Step Expected"),
+}
+CREDENTIAL = re.compile(r"(?i)\b(password|passwd|secret|api[_-]?key|token)\s*[:=]\s*(?!\{\{)\S{3,}|\bBearer\s+[A-Za-z0-9._-]{12,}")
+UNOBSERVABLE = re.compile(r"(?i)\b(works|correctly|successfully|as expected)\b")
+
+
+def ticket_ids(root, ticket):
+    idx = json.loads((root / "02-analysis" / ticket / "requirements" / "_index.json").read_text())
+    acs = {a["id"]: set(a.get("requirements") or []) for a in idx.get("acceptanceCriteria", []) if a.get("id")}
+    reqs = {r["id"] for r in idx.get("requirements", []) if r.get("id")}
+    return acs, reqs
+
+
+def read_case_csv(path):
+    """(raw bytes, header, {field: column index}, cases, rows); a case spans its continuation rows."""
+    raw = path.read_bytes()
+    rows = [r for r in csv.reader(io.StringIO(raw.decode("utf-8-sig", errors="replace"))) if any(c.strip() for c in r)]
+    if not rows:
+        return raw, [], {}, [], []
+    header = [h.strip() for h in rows[0]]
+    col = {k: next((header.index(n) for n in names if n in header), None) for k, names in COL.items()}
+    cases, cur = [], None
+    for r in rows[1:]:
+        get = lambda k: (r[col[k]].strip() if col[k] is not None and col[k] < len(r) else "")
+        if get("id") or get("title"):
+            cur = {"id": get("id"), "title": get("title"), "priority": get("priority"), "refs": get("refs"),
+                   "expected": [get("expected")]}
+            cases.append(cur)
+        elif cur is not None:
+            cur["expected"].append(get("expected"))
+    return raw, header, col, cases, rows
+
+
+def gate_manual(root, ticket, rep):
+    acs, reqs = ticket_ids(root, ticket)
+    mine = set(acs) | reqs
+    files = []
+    for f in sorted((root / "03-tests" / "manual").rglob("TEST_CASES.csv")) if (root / "03-tests" / "manual").is_dir() else []:
+        text = f.read_text(encoding="utf-8-sig", errors="replace")
+        if any(i in text for i in mine) or f"-{ticket}-" in text:
+            files.append(f)
+    rep.add("M1", "manual case files for this ticket (03-tests/manual/**/TEST_CASES.csv)", PASS if files else FAIL,
+            ", ".join(str(f.relative_to(root)) for f in files) if files else "no TEST_CASES.csv references this ticket")
+    if not files:
+        return
+    bad_parse, no_bom, no_cols, incomplete, cases_all, cred, vague, no_md = [], [], [], [], [], [], [], []
+    waived = set()
+    for f in files:
+        raw, header, col, cases, rows = read_case_csv(f)
+        rel = str(f.relative_to(root))
+        if not raw.startswith(b"\xef\xbb\xbf"):
+            no_bom.append(rel)
+        widths = {len(r) for r in rows}
+        if len(widths) > 1:
+            bad_parse.append(f"{rel}: rows of {sorted(widths)} columns")
+        missing = [k for k in ("id", "title", "expected", "refs") if col.get(k) is None]
+        if missing:
+            no_cols.append(f"{rel}: no {'/'.join(missing)} column")
+        for c in cases:
+            gaps = [k for k in ("id", "title", "priority", "refs") if col.get(k) is not None and not c[k]]
+            if gaps:
+                incomplete.append(f"{c['id'] or c['title'][:30]}: {','.join(gaps)}")
+            vague += [c["id"]] if any(UNOBSERVABLE.search(e) for e in c["expected"]) else []
+        cases_all += cases
+        text = raw.decode("utf-8-sig", errors="replace")
+        cred += [rel] if CREDENTIAL.search(text) else []
+        md = f.with_name("TEST_CASES.md")
+        if not md.exists():
+            no_md.append(rel)
+        else:
+            sec = re.search(r"(?ms)^## Not covered manually\s*\n(.*?)(?=^## |\Z)", md.read_text(encoding="utf-8"))
+            waived |= set(re.findall(r"^\s*-\s*(AC-[\w-]+)\s*:", sec.group(1), re.M)) if sec else set()
+    rep.add("M2", "CSV imports: UTF-8 with BOM, same column count on every row",
+            FAIL if bad_parse or no_bom else PASS, offenders=bad_parse + [f"{x}: no BOM" for x in no_bom])
+    rep.add("M3", "CSV has ID, title, expected result and reference columns", FAIL if no_cols else PASS, offenders=no_cols)
+    rep.add("M4", "every case has ID, title, priority and a reference", FAIL if incomplete else PASS, offenders=incomplete)
+    ids = [c["id"] for c in cases_all if c["id"]]
+    dup = sorted({i for i in ids if ids.count(i) > 1})
+    rep.add("M5", f"case IDs unique ({len(ids)} cases)", FAIL if dup else PASS, offenders=dup)
+    refs = " ".join(c["refs"] for c in cases_all)
+    uncovered = sorted(a for a, r in acs.items()
+                       if a not in waived and not re.search(rf"\b{re.escape(a)}\b", refs)
+                       and not any(re.search(rf"\b{re.escape(x)}\b", refs) for x in r))
+    rep.add("M6", f"every acceptance criterion has a manual case or a waiver ({len(acs)} AC, {len(waived & set(acs))} waived)",
+            FAIL if uncovered else PASS, "uncovered", uncovered)
+    rep.add("M7", "no credential in the case files", FAIL if cred else PASS, offenders=cred)
+    rep.add("M8", "TEST_CASES.md beside every CSV", FAIL if no_md else PASS, offenders=no_md)
+    rep.add("M9", "no unobservable expected result ('works', 'correctly', 'successfully', 'as expected')",
+            WARN if vague else PASS, "review", sorted(set(vague)))
+
+
+# ---------------------------------------------------------------- Gate E — manual execution
+RESULT = {"pass": "pass", "passed": "pass", "fail": "fail", "failed": "fail", "fail (expected)": "expected-fail",
+          "expected fail": "expected-fail", "blocked": "blocked", "skipped": "skipped", "skip": "skipped"}
+
+
+def gate_execution(root, ticket, rep):
+    edir = root / "04-results" / ticket / "executions"
+    rounds = sorted(edir.glob("*.md")) if edir.is_dir() else []
+    rep.add("E1", "an execution record exists (04-results/<T>/executions/*.md)", PASS if rounds else FAIL,
+            ", ".join(f.name for f in rounds) if rounds else "no round recorded yet")
+    if not rounds:
+        return
+    last = max(rounds, key=lambda f: f.stat().st_mtime)
+    text = last.read_text(encoding="utf-8")
+    rows = re.findall(r"^\|\s*(TC-[\w-]+)\s*\|\s*([^|]*?)\s*\|\s*([^|]*?)\s*\|\s*$", text, re.M)
+    head = re.search(r"^# Execution\b.*?(\d{4}-\d{2}-\d{2})", text, re.M)
+    rep.add("E2", f"round header names date, build and environment ({last.name})",
+            PASS if head and re.search(r"(?im)^(build|.*·)", text) else FAIL)
+    blank = [c for c, r, _ in rows if RESULT.get(re.sub(r"[*_]", "", r).strip().lower()) is None]
+    rep.add("E3", f"every case has a result: pass, fail, fail (expected), blocked or skipped ({len(rows)} rows)",
+            FAIL if blank or not rows else PASS, offenders=blank or (["no result table"] if not rows else []))
+    pack = root / "04-results" / ticket / "EXECUTE.md"
+    planned = set(re.findall(r"\bTC-[\w-]+\b", pack.read_text(encoding="utf-8"))) if pack.exists() else set()
+    unrecorded = sorted(planned - {c for c, _, _ in rows})
+    rep.add("E4", "every case in EXECUTE.md has a row in the round", (FAIL if unrecorded else PASS) if planned else WARN,
+            "" if planned else "no EXECUTE.md pack", unrecorded)
+    manual_ids = set()
+    for f in (root / "03-tests" / "manual").rglob("TEST_CASES.csv") if (root / "03-tests" / "manual").is_dir() else []:
+        manual_ids |= set(re.findall(r"\bTC-[\w-]+\b", f.read_text(encoding="utf-8-sig", errors="replace")))
+    unknown = sorted({c for c, _, _ in rows} - manual_ids)
+    rep.add("E5", "every executed case exists in 03-tests/manual", FAIL if unknown else PASS, offenders=unknown)
+    no_ev = []
+    for c, r, note in rows:
+        if RESULT.get(re.sub(r"[*_]", "", r).strip().lower()) != "fail":
+            continue
+        sec = re.search(rf"(?ms)^##\s+{re.escape(c)}\b(.*?)(?=^## |\Z)", text)
+        body = (sec.group(1) if sec else "") + " " + note
+        paths = re.findall(r"evidence/[\w./-]+", body)
+        ok = bool(paths) and all((last.parent.parent / p).exists() or (root / p).exists() for p in paths) \
+            and re.search(r"\b\d{1,2}:\d{2}\b", body)
+        no_ev += [] if ok else [c]
+    rep.add("E6", "every unexpected failure has an evidence file that exists and a time", FAIL if no_ev else PASS,
+            offenders=no_ev)
+
+
+# ---------------------------------------------------------------- Gate R — report numbers
+def raw_outcomes(path):
+    """{test id: 'pass' | 'fail' | 'flaky' | 'skipped'} and the per-status counts of one Playwright report."""
+    doc = json.loads(Path(path).read_text(encoding="utf-8"))
+    out, counts = {}, {"passed": 0, "expectedFailures": 0, "unexpectedFailures": 0, "flaky": 0}
+
+    def walk(s):
+        for sp in s.get("specs", []):
+            yield sp
+        for c in s.get("suites", []):
+            yield from walk(c)
+    for top in doc.get("suites", []):
+        for sp in walk(top):
+            m = re.match(r"^([A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+)\b", sp.get("title", ""))
+            for t in sp.get("tests", []):
+                st, exp = t.get("status"), t.get("expectedStatus")
+                if st == "skipped":
+                    res = "skipped"
+                elif st == "flaky":
+                    res = "flaky"
+                elif st == "expected":
+                    res = "fail" if exp == "failed" else "pass"
+                else:
+                    res = "pass" if exp == "failed" else "fail"
+                if m:
+                    out[m.group(1)] = (res, st, exp)
+    return out
+
+
+def gate_report(root, ticket, rep, path=None):
+    f = Path(path) if path else root / "04-results" / ticket / "REPORT.html"
+    if not f.is_absolute():
+        f = root / f
+    if not f.exists():
+        rep.add("RP1", "REPORT.html exists", FAIL, f"missing: {f.relative_to(root) if f.is_relative_to(root) else f}")
+        return
+    html = f.read_text(encoding="utf-8")
+    m = re.search(r'<script id="report-data" type="application/json">\s*(.*?)\s*</script>', html, re.S)
+    try:
+        data = json.loads(m.group(1)) if m else None
+    except json.JSONDecodeError as e:
+        data, err = None, str(e)
+    rep.add("RP1", "REPORT.html has a report-data JSON block", PASS if data else FAIL,
+            "" if data else ("no report-data block" if not m else f"invalid JSON: {err}"))
+    if not data:
+        return
+    ext = re.findall(r'(?i)(?:src|href)\s*=\s*["\'](https?://[^"\']+)|@import\s+url\(\s*["\']?(https?://[^)"\']+)', html)
+    ext = sorted({a or b for a, b in ext})
+    rep.add("RP2", "self-contained: no external scripts, styles or fonts", FAIL if ext else PASS, offenders=ext)
+
+    tests = [t for t in data.get("tests", []) if isinstance(t, dict) and t.get("id")]
+    want = {t["id"] for t in tests}
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import qa_events
+    events, _ = qa_events.read(root)
+    by_suite = {}
+    for ev in events:
+        if ev.get("kind") == "run" and ev.get("source") and (root / ev["source"]).exists():
+            by_suite.setdefault(ev["suite"], []).append(ev)
+    n_runs = (data.get("meta") or {}).get("runs") or (data.get("stability") or {}).get("runs")
+    raw = {}       # test id -> [results, oldest first] over the last n_runs runs of its suite
+    used = []
+    for suite, evs in by_suite.items():
+        evs = sorted(evs, key=lambda e: e.get("ts") or "")[-(n_runs or len(evs)):]
+        outs = [raw_outcomes(root / e["source"]) for e in evs]
+        if want and not any(want & set(o) for o in outs):
+            continue
+        used.append((suite, evs, outs))
+        for o in outs:
+            for tid, v in o.items():
+                if not want or tid in want:
+                    raw.setdefault(tid, []).append(v)
+    rep.add("RP3", "the report's runs are recorded (`qa-event run`) and their raw files exist",
+            PASS if used else FAIL, ", ".join(f"{s}: {len(e)} runs" for s, e, _ in used) or "no recorded run covers these tests")
+    if not used:
+        return
+    last = {tid: v[-1] for tid, v in raw.items()}
+    calc = {"passed": sum(1 for r, st, exp in last.values() if st == "expected" and exp != "failed"),
+            "expectedFailures": sum(1 for r, st, exp in last.values() if st == "expected" and exp == "failed"),
+            "unexpectedFailures": sum(1 for r, st, _ in last.values() if st == "unexpected"),
+            "flaky": sum(1 for r, st, _ in last.values() if st == "flaky")}
+    summ = data.get("summary") or {}
+    diff = [f"{k}: report {summ.get(k)}, raw {v}" for k, v in calc.items() if summ.get(k) != v]
+    rep.add("RP4", "summary recomputed from the last run's raw report", FAIL if diff else PASS, offenders=diff)
+    run_diff, missing = [], []
+    for t in tests:
+        if t["id"] not in raw:
+            if not t.get("manual") or t.get("runs"):
+                missing.append(t["id"])
+            continue
+        runs = t.get("runs")
+        if isinstance(runs, list) and runs:
+            got = [r for r, _, _ in raw[t["id"]]][-len(runs):]
+            if [str(x).lower() for x in runs] != got:
+                run_diff.append(f"{t['id']}: report {runs}, raw {got}")
+    rep.add("RP5", "per-test run results match the raw reports", FAIL if run_diff else PASS, offenders=run_diff)
+    rep.add("RP6", "every automated test in the report is in a raw report", FAIL if missing else PASS, offenders=missing)
+    stab = data.get("stability") or {}
+    if stab.get("runs") is not None:
+        k = max(len(e) for _, e, _ in used)
+        rep.add("RP7", "stability.runs equals the raw runs used", PASS if stab["runs"] == k else FAIL,
+                f"report {stab['runs']}, raw {k}")
+    defects = [d for d in data.get("defects", []) if isinstance(d, dict)]
+    sev_diff = []
+    for d in defects:
+        bf = root / "bugs" / f"{d.get('id')}.md"
+        if bf.exists():
+            row = re.search(r"^\|\s*Severity\s*\|\s*\**([A-Za-z]+)", bf.read_text(encoding="utf-8"), re.M)
+            if row and row.group(1).lower() != str(d.get("severity", "")).lower():
+                sev_diff.append(f"{d['id']}: report {d.get('severity')}, bugs/ {row.group(1).lower()}")
+    counted = {}
+    for d in defects:
+        counted[str(d.get("severity", "")).lower()] = counted.get(str(d.get("severity", "")).lower(), 0) + 1
+    ds = {str(k).lower(): v for k, v in (data.get("defectSummary") or {}).items()}
+    if ds and ds != counted:
+        sev_diff.append(f"defectSummary {ds} vs defects listed {counted}")
+    rep.add("RP8", "defect severities match bugs/*.md and defectSummary", FAIL if sev_diff else PASS, offenders=sev_diff)
+    dangling = sorted({f"{d.get('id')}→{x}" for d in defects for x in d.get("tests") or [] if x not in want})
+    rep.add("RP9", "every test a defect cites is in the catalogue", FAIL if dangling else PASS, offenders=dangling)
+
+
+# ---------------------------------------------------------------- stage gate files
+def self_check_items(skill):
+    """Number of items in the skill's self-check section; None if no section, -1 if no such skill."""
+    for d in SKILL_DIRS:
+        p = d / skill / "SKILL.md"
+        if p.exists():
+            break
+    else:
+        return -1
+    count, level = None, 0
+    for line in p.read_text(encoding="utf-8").split("\n"):
+        m = re.match(r"^(#{2,3}) Self-check", line)
+        if m and count is None:
+            count, level = 0, len(m.group(1))
+            continue
+        if count is not None:
+            h = re.match(r"^(#{1,6}) ", line)
+            if h and len(h.group(1)) <= level:
+                break
+            if re.match(r"^\d+\. ", line):
+                count += 1
+    return count
+
+
+def gate_path(root, ticket, stage):
+    return root / "02-analysis" / ticket / "_gates" / f"{stage}.json"
+
+
+def check_critic(root, ticket, stage, rep):
+    """A <stage>.critic.json: schema, every rubric item answered, open disagreements in needsEngineer."""
+    base = stage[:-len(".critic")]
+    cf = gate_path(root, ticket, stage)
+    doc = load_json(cf, rep, "K1", f"critic file {cf.relative_to(root)}")
+    if doc is None:
+        rep.add("G0", "a critic that reports done has written its critic file", FAIL,
+                "record it with `qa-critic record <TICKET> <STAGE> <output.json> --backend … --model …`")
+        return
+    rep.add("K1", "critic file exists and is valid JSON", PASS)
+    errs = qa_schema.validate(doc, qa_schema.load("critic"))
+    rep.add("K2", "critic file matches schemas/critic", FAIL if errs else PASS, offenders=errs)
+    rub = TOOLKIT / "rubrics" / f"{doc.get('rubric')}.md"
+    ids = re.findall(r"^\|\s*([A-Z]+\d+)\s*\|", rub.read_text(encoding="utf-8"), re.M) if rub.exists() else []
+    answered = [i.get("id") for i in doc.get("items") or [] if isinstance(i, dict)]
+    missing = [i for i in ids if i not in answered]
+    rep.add("K3", f"every item of rubrics/{doc.get('rubric')}.md answered ({len(ids)})",
+            FAIL if missing or not ids else PASS, "missing" if missing else ("no rubric" if not ids else ""), missing)
+    open_ = [d for d in doc.get("disagreements") or [] if isinstance(d, dict) and not d.get("resolution")]
+    rep.add("K4", "verdict agrees with the open disagreements",
+            FAIL if open_ and doc.get("verdict") == "agree" else PASS)
+    gate = json.loads(gate_path(root, ticket, base).read_text()) if gate_path(root, ticket, base).exists() else {}
+    listed = {q.get("critic") for q in gate.get("needsEngineer") or [] if isinstance(q, dict)}
+    absent = [d["id"] for d in open_ if d.get("id") not in listed]
+    rep.add("K5", f"every open disagreement is a question in {base}.json needsEngineer", FAIL if absent else PASS,
+            offenders=absent)
+
+
+def check_stage(root, ticket, stage, rep, rerun=False, require_passed=False, path=None):
+    if stage.endswith(".critic"):
+        return check_critic(root, ticket, stage, rep)
+    gf = Path(path) if path else gate_path(root, ticket, stage)
+    doc = load_json(gf, rep, "G1", f"gate file {gf.relative_to(root) if gf.is_relative_to(root) else gf}")
+    if doc is None:
+        rep.add("G0", "a stage that reports done has written its gate file", FAIL,
+                "write it as the agent's 'Gate file' section describes, then report")
+        return
+    rep.add("G1", "gate file exists and is valid JSON", PASS)
+    errs = qa_schema.validate(doc, qa_schema.load("gate-file"))
+    rep.add("G2", "gate file matches schemas/gate-file", FAIL if errs else PASS, offenders=errs)
+
+    wrong = [f"{k}={doc.get(k)!r}" for k, want in (("stage", stage), ("ticket", ticket))
+             if not (doc.get(k) == want or (k == "ticket" and ticket == "_project"))]
+    rep.add("G3", "ticket and stage fields name this stage", FAIL if wrong else PASS, offenders=wrong)
+
+    checks = doc.get("selfCheck") or []
+    ids = [c.get("id") for c in checks if isinstance(c, dict)]
+    n = self_check_items(stage)
+    if n == -1:
+        rep.add("G4", "selfCheck covers the skill's self-check", SKIP, f"no skill named {stage}")
+    elif n is None:
+        rep.add("G4", "selfCheck covers the skill's completion criteria", PASS if checks else FAIL,
+                f"{stage} has no self-check section; {len(checks)} entries recorded")
+    else:
+        missing = sorted(set(range(1, n + 1)) - set(ids))
+        extra = sorted({str(i) for i in ids if not isinstance(i, int) or not 1 <= i <= n}
+                       | {str(i) for i in ids if ids.count(i) > 1})
+        rep.add("G4", f"selfCheck has one entry per self-check item of {stage} ({n})",
+                FAIL if missing or extra else PASS,
+                "missing" if missing else "unexpected or duplicate ids", missing or extra)
+
+    mech = doc.get("mechanical") or {}
+    mech_bad = [f"{k}: exit {v.get('exitCode')}" for k, v in mech.items() if isinstance(v, dict) and v.get("exitCode") != 0]
+    failed = [f"#{c.get('id')} {c.get('gate', '')[:40]}" for c in checks if isinstance(c, dict) and c.get("result") == "fail"]
+    status = doc.get("status")
+    lie = status == "passed" and (failed or mech_bad)
+    rep.add("G5", "status agrees with the results (one failure is never 'passed')", FAIL if lie else PASS,
+            f"status passed with failures" if lie else "", (failed + mech_bad) if lie else None)
+
+    need = MECHANICAL.get(stage)
+    if need:
+        have = any(k.split()[0] == need for k in mech)
+        rep.add("G6", f"mechanical gate recorded (qa-gate {need} … --write {stage})",
+                PASS if have else (FAIL if status == "passed" else WARN),
+                "" if have else "missing: run the stage's qa-gate command with --write")
+    if status == "blocked":
+        rep.add("G7", "a blocked stage says what it needs from the engineer",
+                PASS if doc.get("needsEngineer") else FAIL, "" if doc.get("needsEngineer") else "needsEngineer is empty")
+
+    if rerun:
+        diffs = []
+        for key, rec in mech.items():
+            argv = (rec.get("tool") or "").split()[1:]
+            if not argv:
+                continue
+            if argv[0] == "code" and "--ticket" not in argv:
+                argv += ["--ticket", ticket]
+            r = subprocess.run([sys.executable, os.path.realpath(__file__), *argv, "--root", str(root)],
+                               capture_output=True, text=True, timeout=900)
+            if r.returncode != rec.get("exitCode"):
+                diffs.append(f"{key}: recorded {rec.get('exitCode')}, now {r.returncode}")
+        rep.add("G8", "mechanical gates give the recorded result when re-run", FAIL if diffs else PASS, offenders=diffs)
+    if require_passed:
+        rep.add("G9", "stage passed", PASS if status == "passed" else FAIL, f"status is {status!r}")
+        cf = gate_path(root, ticket, f"{stage}.critic")
+        if cf.exists():
+            try:
+                crit = json.loads(cf.read_text())
+            except json.JSONDecodeError:
+                crit = {}
+            open_ = [d.get("id") for d in crit.get("disagreements") or [] if isinstance(d, dict) and not d.get("resolution")]
+            rep.add("G10", "no unresolved critic disagreement (qa-critic resolve)", FAIL if open_ else PASS,
+                    offenders=open_)
+
+
+def check_pipeline(root, target, rep, since_min=None):
+    cutoff = time.time() - since_min * 60 if since_min else 0
+    adir = root / "02-analysis"
+    tickets = [target] if target != "all" else sorted(p.name for p in adir.iterdir() if p.is_dir()) if adir.is_dir() else []
+    pipe_errs, stage_errs, recent_errs, in_progress, seen = [], [], [], [], 0
+    for t in tickets:
+        pf = root / "02-analysis" / t / "_pipeline.json"
+        if pf.exists() and pf.stat().st_mtime >= cutoff:
+            seen += 1
+            try:
+                doc = json.loads(pf.read_text())
+            except json.JSONDecodeError as e:
+                pipe_errs.append(f"{t}: {e}")
+                continue
+            pipe_errs += [f"{t} {e}" for e in qa_schema.validate(doc, qa_schema.load("pipeline"))]
+            for stage, st in (doc.get("stages") or {}).items():
+                if not isinstance(st, dict) or st.get("status") != "passed":
+                    continue
+                sub = Report("stage")
+                gf = st.get("gateFile")
+                check_stage(root, t, stage, sub, require_passed=True, path=(root / gf) if gf else None)
+                stage_errs += [f"{t}/{stage} {c['id']} {c['check']}" + (f" — {c['detail']}" if c["detail"] else "")
+                               for c in sub.checks if c["result"] == FAIL]
+        if since_min:
+            for gf in sorted((root / "02-analysis" / t / "_gates").glob("*.json")):
+                if gf.stat().st_mtime < cutoff:
+                    continue
+                try:
+                    partial = set(json.loads(gf.read_text())) <= {"ticket", "stage", "agent", "mechanical"}
+                except (ValueError, TypeError):
+                    partial = False
+                if partial:  # only `qa-gate --write` so far: the stage is still running; its agent's stop checks it
+                    in_progress.append(f"{t}/{gf.stem}")
+                    continue
+                sub = Report("stage")
+                check_stage(root, t, gf.stem, sub)
+                recent_errs += [f"{t}/{gf.stem} {c['id']} {c['check']}" + (f" — {c['detail']}" if c["detail"] else "")
+                                for c in sub.checks if c["result"] == FAIL]
+    rep.add("P1", f"_pipeline.json valid ({seen} checked)", FAIL if pipe_errs else PASS, offenders=pipe_errs)
+    rep.add("P2", "every stage marked passed has a gate file that passes", FAIL if stage_errs else PASS,
+            offenders=stage_errs)
+    if since_min:
+        rep.add("P3", f"gate files written in the last {since_min} min are complete", FAIL if recent_errs else PASS,
+                offenders=recent_errs)
+        if in_progress:
+            rep.add("P4", "stages still running (only a mechanical result so far)", WARN, offenders=in_progress)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("cmd", choices=["reqs", "scenarios", "code", "manual", "execution", "report", "schema",
+                                    "check-stage", "check-pipeline"])
+    ap.add_argument("--file", help="report: the REPORT.html to check (default 04-results/<TICKET>/REPORT.html)")
+    ap.add_argument("target")
+    ap.add_argument("rest", nargs="*", help="schema: files · check-stage: STAGE")
+    ap.add_argument("--rerun", action="store_true")
+    ap.add_argument("--require-passed", action="store_true")
+    ap.add_argument("--since", type=int, metavar="MIN")
+    ap.add_argument("--root")
+    ap.add_argument("--ticket")
+    ap.add_argument("--ui", action="store_true")
+    ap.add_argument("--run", action="store_true")
+    ap.add_argument("--write", metavar="STAGE")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+
+    if a.cmd == "schema":
+        if a.target not in qa_schema.names() or not a.rest:
+            print(f"qa-gate schema <{'|'.join(qa_schema.names())}> <FILE>...", file=sys.stderr)
+            return 2
+        rep = Report(f"schema {a.target}")
+        sch = qa_schema.load(a.target)
+        for i, f in enumerate(a.rest, 1):
+            try:
+                errs = qa_schema.validate(json.loads(Path(f).read_text()), sch)
+            except (OSError, json.JSONDecodeError) as e:
+                errs = [str(e)]
+            rep.add(f"V{i}", f"{f} matches {a.target}", FAIL if errs else PASS, offenders=errs)
+        print(json.dumps(rep.as_dict(), indent=2, ensure_ascii=False)) if a.json else rep.print_table()
+        return rep.as_dict()["exitCode"]
+
+    root = Path(a.root).resolve() if a.root else find_root(os.getcwd())
+    if not root:
+        print("qa-gate: no .qa-project above $PWD; pass --root", file=sys.stderr)
+        return 2
+    if a.cmd in ("check-stage", "check-pipeline"):
+        rep = Report(f"{a.cmd} {a.target} {' '.join(a.rest)}".strip())
+        if a.cmd == "check-stage":
+            if len(a.rest) != 1:
+                print("qa-gate check-stage <TICKET> <STAGE>", file=sys.stderr)
+                return 2
+            check_stage(root, a.target, a.rest[0], rep, rerun=a.rerun, require_passed=a.require_passed)
+        else:
+            check_pipeline(root, a.target, rep, a.since)
+        print(json.dumps(rep.as_dict(), indent=2, ensure_ascii=False)) if a.json else rep.print_table()
+        return rep.as_dict()["exitCode"]
+    rep = Report(f"{a.cmd} {a.target}" + (" --ui" if a.ui else ""))
+    ticket = a.ticket if a.cmd == "code" else a.target
+    if a.cmd != "code" and not (root / "02-analysis" / ticket).is_dir():
+        print(f"qa-gate: no 02-analysis/{ticket} under {root}", file=sys.stderr)
+        return 2
+
+    if a.cmd == "reqs":
+        gate_reqs(root, ticket, rep)
+    elif a.cmd == "scenarios":
+        gate_scenarios(root, ticket, rep)
+    elif a.cmd == "manual":
+        gate_manual(root, ticket, rep)
+    elif a.cmd == "execution":
+        gate_execution(root, ticket, rep)
+    elif a.cmd == "report":
+        gate_report(root, ticket, rep, a.file)
+    else:
+        target = Path(a.target)
+        gate_code(root, target if target.is_absolute() else root / target, a.ui, a.run, ticket, rep)
+
+    result = rep.as_dict()
+    if a.write:
+        if not ticket:
+            print("qa-gate: --write needs --ticket for `code`", file=sys.stderr)
+            return 2
+        gdir = root / "02-analysis" / ticket / "_gates"
+        gdir.mkdir(parents=True, exist_ok=True)
+        gf = gdir / f"{a.write}.json"
+        doc = json.loads(gf.read_text()) if gf.exists() else {"ticket": ticket, "stage": a.write}
+        doc.setdefault("mechanical", {})[a.cmd + (" --ui" if a.ui else "")] = result
+        gf.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
+        tally = {}
+        for c in result.get("checks", []):
+            tally[c.get("result")] = tally.get(c.get("result"), 0) + 1
+        try:
+            qa_events.append(root, dict(kind="gate", ticket=ticket, stage=a.write, command=result.get("tool"),
+                                        exitCode=result["exitCode"], checks=tally,
+                                        source=str(gf.relative_to(root))))
+        except (OSError, ValueError) as e:
+            print(f"qa-gate: metric event not written: {e}", file=sys.stderr)
+
+    print(json.dumps(result, indent=2, ensure_ascii=False)) if a.json else rep.print_table()
+    return result["exitCode"]
+
+
+if __name__ == "__main__":
+    sys.exit(main())

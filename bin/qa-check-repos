@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# qa-check-repos — every repo in GC_SOURCE_REPOS is readable. Silent on success.
+set -uo pipefail
+source "$HOME/.qa-agent/bin/qa-env.sh" && qa_load "${1:-}" || exit 2
+fail=0
+for r in ${GC_SOURCE_REPOS//,/ }; do
+  GIT_TERMINAL_PROMPT=0 git -c http.lowSpeedLimit=1 -c http.lowSpeedTime=20 ls-remote "$r" HEAD >/dev/null 2>&1 || { echo "repo $r — not readable"; fail=1; }
+done
+exit $fail

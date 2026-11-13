@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""qa-critic — an independent review of a stage against a rubric, recorded next to its gate file.
+
+  qa-critic prompt  <TICKET> <STAGE> [--rubric R]       the review task for any critic: rubric,
+                                                        artefacts to read, the output format
+  qa-critic record  <TICKET> <STAGE> <output.json> --backend B --model M [--rubric R]
+        Validate a critic's output against schemas/critic.schema.json and the rubric (every item
+        answered), work out independence from the producing stage's model, write
+        _gates/<STAGE>.critic.json, and copy every unresolved disagreement into the stage gate
+        file's needsEngineer, so the engineer sees it and check-stage --require-passed refuses
+        `passed` until it is resolved.
+  qa-critic resolve <TICKET> <STAGE> <CR-n> --answer TEXT [--by engineer|default]
+        Record the engineer's decision on one disagreement and take it out of needsEngineer.
+  qa-critic run     <TICKET> <STAGE> --backend ollama|codex|gemini|cursor-agent [--model M]
+        Run a critic from another vendor or a local model and record its output. codex, gemini
+        and cursor-agent send the artefacts to an outside service: they run only when the
+        profile's INTEGRATIONS has `llm-review`. ollama runs on this machine.
+
+Without --rubric: requirements-decomposer -> requirements, automation-api / automation-ui -> code.
+Backends `claude-agent` (the qa-critic subagent in Claude Code) and `cursor-subagent` write their
+output file and call `record` themselves. Options: --root DIR. Exit 0 ok · 1 invalid · 2 usage ·
+3 backend unavailable or not allowed.
+"""
+import argparse, datetime, json, os, re, shutil, subprocess, sys, urllib.request
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import qa_events  # noqa: E402
+import qa_schema  # noqa: E402
+
+TK = Path(os.path.realpath(__file__)).parent.parent
+RUBRIC_OF = {"requirements-decomposer": "requirements", "automation-api": "code", "automation-ui": "code"}
+INPUTS = {
+    "requirements": ["02-analysis/{T}/_source.json", "02-analysis/{T}/_fetch.json", "02-analysis/{T}/requirements/"],
+    "code": ["02-analysis/{T}/scenarios/", "{TEST_DIR}"],
+}
+VENDOR = [(r"^claude|anthropic|opus|sonnet|haiku|fable", "anthropic"), (r"^(gpt|o\d|codex|openai)", "openai"),
+          (r"gemini|google", "google"), (r"mistral|codestral", "mistral"), (r"grok|xai", "xai")]
+LOCAL_BACKENDS = {"ollama"}
+OUTSIDE_BACKENDS = {"codex": ["codex", "exec"], "gemini": ["gemini", "-p"], "cursor-agent": ["cursor-agent", "-p"]}
+
+
+def vendor_of(model, backend=None):
+    if backend in LOCAL_BACKENDS:
+        return "local"
+    m = (model or "").lower()
+    return next((v for pat, v in VENDOR if re.search(pat, m)), None)
+
+
+def rubric_items(name):
+    text = (TK / "rubrics" / f"{name}.md").read_text(encoding="utf-8")
+    return re.findall(r"^\|\s*([A-Z]+\d+)\s*\|", text, re.M), text
+
+
+def gate_path(root, ticket, stage, critic=False):
+    return root / "02-analysis" / ticket / "_gates" / (f"{stage}.critic.json" if critic else f"{stage}.json")
+
+
+def load(path, default=None):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, doc):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def producer_model(root, ticket, stage):
+    events, _ = qa_events.read(root)
+    models = [e.get("model") for e in events if e.get("kind") == "stage" and e.get("stage") == stage
+              and e.get("ticket") in (ticket, None if ticket == "_project" else ticket) and e.get("model")]
+    return models[-1] if models else None
+
+
+def test_dir(root, ticket, stage):
+    gate = load(gate_path(root, ticket, stage), {}) or {}
+    for key, rec in (gate.get("mechanical") or {}).items():
+        m = re.search(r"qa-gate code (\S+)", (rec or {}).get("tool", ""))
+        if m:
+            return m.group(1)
+    return "03-tests/ui" if stage == "automation-ui" else "03-tests/api"
+
+
+def prompt(root, ticket, stage, rubric):
+    ids, text = rubric_items(rubric)
+    paths = [p.replace("{T}", ticket).replace("{TEST_DIR}", test_dir(root, ticket, stage)) for p in INPUTS.get(rubric, [])]
+    paths = [p for p in paths if (root / p.rstrip("/")).exists()]
+    return f"""You are an independent critic of one stage of a QA pipeline. Workspace: {root}
+Ticket: {ticket}   Stage reviewed: {stage}   Rubric: toolkit/rubrics/{rubric}.md
+
+{text}
+Read these (workspace-relative): {', '.join(paths) or 'see the rubric'}
+Do not read 02-analysis/{ticket}/_gates/{stage}.json before you have answered every item.
+
+Answer with one JSON object and nothing else:
+{{"items": [{{"id": "<one of {', '.join(ids)}>", "result": "agree|disagree|n/a", "evidence": "<file:line, sample, probe>"}}],
+ "disagreements": [{{"id": "CR-1", "item": "<rubric id>", "severity": "high|medium|low", "refs": ["<requirement or test IDs>"],
+   "finding": "<what is wrong>", "question": "<what the engineer must decide>", "proposedDefault": "<your proposal>",
+   "evidence": "<file:line>"}}]}}
+Every rubric item appears once in "items". Every "disagree" item has at least one disagreement.
+"""
+
+
+def record(root, ticket, stage, out, backend, model, rubric):
+    ids, _ = rubric_items(rubric)
+    doc = dict(out)
+    doc.update(ticket=ticket, stage=stage, rubric=rubric,
+               rubricSha=qa_events.sha256(TK / "rubrics" / f"{rubric}.md"),
+               critic={"backend": backend, "model": model, "vendor": vendor_of(model, backend)},
+               finishedAt=doc.get("finishedAt") or qa_events.now())
+    prod = producer_model(root, ticket, stage)
+    doc["producerModel"] = prod
+    cv, pv = vendor_of(model, backend), vendor_of(prod)
+    doc["independence"] = "local" if cv == "local" else ("unknown" if not (cv and pv) else
+                                                          "same-vendor" if cv == pv else "cross-vendor")
+    old = load(gate_path(root, ticket, stage, critic=True), {}) or {}
+    # a new review numbers its disagreements afresh: an answer carries over only to the same question
+    resolved = {(d.get("item"), d.get("question")): d.get("resolution")
+                for d in old.get("disagreements") or [] if d.get("resolution")}
+    for d in doc.get("disagreements") or []:
+        if (d.get("item"), d.get("question")) in resolved and not d.get("resolution"):
+            d["resolution"] = resolved[(d.get("item"), d.get("question"))]
+    open_ = [d for d in doc.get("disagreements") or [] if not d.get("resolution")]
+    doc["verdict"] = doc.get("verdict") or ("disagree" if open_ else "agree")
+    problems = qa_schema.validate(doc, qa_schema.load("critic"))
+    answered = [i.get("id") for i in doc.get("items") or []]
+    problems += [f"rubric item {i} not answered" for i in ids if i not in answered]
+    problems += [f"unknown rubric item {i}" for i in answered if i not in ids]
+    no_d = [i["id"] for i in doc.get("items") or [] if i.get("result") == "disagree"
+            and not any(d.get("item") == i["id"] for d in doc.get("disagreements") or [])]
+    problems += [f"{i} is disagree but has no disagreement entry" for i in no_d]
+    if open_ and doc["verdict"] == "agree":
+        problems.append("verdict agree with unresolved disagreements")
+    if problems:
+        print("qa-critic: output refused — " + "; ".join(problems[:8]), file=sys.stderr)
+        return 1
+    write_json(gate_path(root, ticket, stage, critic=True), doc)
+    sync_needs(root, ticket, stage, doc)
+    try:
+        qa_events.append(root, dict(kind="counts", ticket=None if ticket == "_project" else ticket,
+                                    stage=f"{stage}.critic", counts={
+                                        "agree": sum(i["result"] == "agree" for i in doc["items"]),
+                                        "disagree": sum(i["result"] == "disagree" for i in doc["items"]),
+                                        "na": sum(i["result"] == "n/a" for i in doc["items"]),
+                                        "openDisagreements": len(open_)},
+                                    critic={"backend": backend, "model": model, "independence": doc["independence"],
+                                            "verdict": doc["verdict"]},
+                                    source=str(gate_path(root, ticket, stage, critic=True).relative_to(root))))
+    except ValueError as e:
+        print(f"qa-critic: metric event not written: {e}", file=sys.stderr)
+    print(f"{ticket} {stage}: critic {doc['verdict']} ({doc['independence']}, {model}), "
+          f"{len(open_)} open disagreement(s) -> needsEngineer")
+    return 0
+
+
+def sync_needs(root, ticket, stage, doc):
+    """Unresolved disagreements are needsEngineer entries of the stage gate file, tagged with their id."""
+    gf = gate_path(root, ticket, stage)
+    gate = load(gf, None)
+    if gate is None:
+        return
+    keep = [q for q in gate.get("needsEngineer") or [] if not (isinstance(q, dict) and q.get("critic"))]
+    for d in doc.get("disagreements") or []:
+        if not d.get("resolution"):
+            keep.append({"question": f"critic {d['id']} ({d['item']}): {d['question']}",
+                         "proposedDefault": d["proposedDefault"], "critic": d["id"]})
+    gate["needsEngineer"] = keep
+    write_json(gf, gate)
+
+
+def resolve(root, ticket, stage, cid, answer, by):
+    cf = gate_path(root, ticket, stage, critic=True)
+    doc = load(cf, None)
+    if not doc:
+        print(f"qa-critic: no {cf.relative_to(root)}", file=sys.stderr)
+        return 2
+    hit = [d for d in doc.get("disagreements") or [] if d.get("id") == cid]
+    if not hit:
+        print(f"qa-critic: no disagreement {cid}", file=sys.stderr)
+        return 2
+    hit[0]["resolution"] = {"answer": answer, "by": by, "at": qa_events.now()}
+    if not any(not d.get("resolution") for d in doc["disagreements"]):
+        doc["verdict"] = "agree" if all(d["resolution"]["by"] == "engineer" for d in doc["disagreements"]) \
+            else doc["verdict"]
+    write_json(cf, doc)
+    sync_needs(root, ticket, stage, doc)
+    try:
+        qa_events.append(root, dict(kind="decision", id=cid, by=by, answer=answer,
+                                    ticket=None if ticket == "_project" else ticket, note=f"critic of {stage}"))
+    except ValueError:
+        pass
+    print(f"{ticket} {stage} {cid}: resolved by {by}")
+    return 0
+
+
+def profile_integrations(root):
+    project = qa_events.project_of(root)
+    home = Path(os.path.expanduser(os.environ.get("QA_AGENT_HOME", "~/.qa-agent")))
+    try:
+        for line in (home / "projects" / project / "profile.env").read_text(encoding="utf-8").splitlines():
+            m = re.match(r"^\s*INTEGRATIONS\s*=\s*([^#]*)", line)
+            if m:
+                return {x.strip() for x in m.group(1).strip().strip("\"'").split(",") if x.strip()}
+    except OSError:
+        pass
+    return set()
+
+
+def first_json(text):
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        for i in range(start, len(text)):
+            depth += {"{": 1, "}": -1}.get(text[i], 0)
+            if depth == 0:
+                try:
+                    return json.loads(text[start:i + 1])
+                except ValueError:
+                    break
+        start = text.find("{", start + 1)
+    return None
+
+
+def inline(root, paths, budget=60000):
+    out, used = [], 0
+    for p in paths:
+        base = root / p.rstrip("/")
+        files = sorted(base.rglob("*")) if base.is_dir() else [base]
+        for f in files:
+            if not f.is_file() or "node_modules" in f.parts or f.suffix not in (".md", ".json", ".ts", ".js", ".yaml", ".yml"):
+                continue
+            body = f.read_text(encoding="utf-8", errors="replace")
+            if used + len(body) > budget:
+                out.append(f"--- {f.relative_to(root)} (not included: over budget)")
+                continue
+            used += len(body)
+            out.append(f"--- {f.relative_to(root)}\n{body}")
+    return "\n".join(out)
+
+
+def run(root, ticket, stage, backend, model, rubric):
+    task = prompt(root, ticket, stage, rubric)
+    if backend in OUTSIDE_BACKENDS:
+        if "llm-review" not in profile_integrations(root):
+            print(f"qa-critic: {backend} sends the artefacts outside this machine; add llm-review to INTEGRATIONS "
+                  f"in the project profile first, or use the qa-critic subagent / ollama", file=sys.stderr)
+            return 3
+        argv = OUTSIDE_BACKENDS[backend]
+        if not shutil.which(argv[0]):
+            print(f"qa-critic: {argv[0]} is not installed", file=sys.stderr)
+            return 3
+        r = subprocess.run(argv + ([] if not model else ["--model", model]) + [task], cwd=root,
+                           capture_output=True, text=True, timeout=1800)
+        out = first_json(r.stdout)
+        model = model or backend
+    elif backend == "ollama":
+        model = model or os.environ.get("QA_CRITIC_OLLAMA_MODEL", "qwen2.5:7b")
+        paths = [p.replace("{T}", ticket).replace("{TEST_DIR}", test_dir(root, ticket, stage)) for p in INPUTS.get(rubric, [])]
+        body = json.dumps({"model": model, "prompt": task + "\n\nFILES\n" + inline(root, paths), "stream": False,
+                           "format": "json", "options": {"num_ctx": 32768}}).encode()
+        try:
+            with urllib.request.urlopen(urllib.request.Request("http://localhost:11434/api/generate", body,
+                                                               {"Content-Type": "application/json"}), timeout=1800) as resp:
+                out = first_json(json.loads(resp.read()).get("response", ""))
+        except OSError as e:
+            print(f"qa-critic: ollama is not reachable on localhost:11434 ({e})", file=sys.stderr)
+            return 3
+    else:
+        print(f"qa-critic: backend {backend} writes its own output; use `record`", file=sys.stderr)
+        return 2
+    if not isinstance(out, dict):
+        print("qa-critic: the critic did not answer with a JSON object", file=sys.stderr)
+        return 1
+    return record(root, ticket, stage, out, backend, model, rubric)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("cmd", choices=["prompt", "record", "resolve", "run"])
+    ap.add_argument("ticket")
+    ap.add_argument("stage")
+    ap.add_argument("arg", nargs="?", help="record: output JSON · resolve: CR-n")
+    ap.add_argument("--rubric")
+    ap.add_argument("--backend", choices=["claude-agent", "cursor-subagent", "ollama", "codex", "gemini", "cursor-agent"])
+    ap.add_argument("--model")
+    ap.add_argument("--answer")
+    ap.add_argument("--by", choices=["engineer", "default"], default="engineer")
+    ap.add_argument("--root")
+    a = ap.parse_args()
+    root = Path(a.root).resolve() if a.root else qa_events.find_root(os.getcwd())
+    if not root:
+        print("qa-critic: no .qa-project above $PWD; pass --root", file=sys.stderr)
+        return 2
+    rubric = a.rubric or RUBRIC_OF.get(a.stage)
+    if a.cmd != "resolve" and (not rubric or not (TK / "rubrics" / f"{rubric}.md").exists()):
+        print(f"qa-critic: no rubric for {a.stage}; pass --rubric <{'|'.join(p.stem for p in (TK / 'rubrics').glob('*.md'))}>",
+              file=sys.stderr)
+        return 2
+    if a.cmd == "prompt":
+        print(prompt(root, a.ticket, a.stage, rubric))
+        return 0
+    if a.cmd == "record":
+        if not (a.arg and a.backend and a.model):
+            print("qa-critic record <TICKET> <STAGE> <output.json> --backend B --model M", file=sys.stderr)
+            return 2
+        out = load(a.arg, None)
+        if not isinstance(out, dict):
+            print(f"qa-critic: {a.arg} is not a JSON object", file=sys.stderr)
+            return 1
+        return record(root, a.ticket, a.stage, out, a.backend, a.model, rubric)
+    if a.cmd == "resolve":
+        if not (a.arg and a.answer):
+            print("qa-critic resolve <TICKET> <STAGE> <CR-n> --answer TEXT", file=sys.stderr)
+            return 2
+        return resolve(root, a.ticket, a.stage, a.arg, a.answer, a.by)
+    if not a.backend:
+        print("qa-critic run needs --backend", file=sys.stderr)
+        return 2
+    return run(root, a.ticket, a.stage, a.backend, a.model, rubric)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

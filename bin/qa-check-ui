@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# qa-check-ui — every UI target loads, is not a server placeholder, and renders its expected
+# first-screen text in a real browser with no console/network errors. Silent on success.
+set -uo pipefail
+source "$HOME/.qa-agent/bin/qa-env.sh" && qa_load "${1:-}" || exit 2
+fail=0
+for t in ${UI_TARGETS//,/ }; do
+  base_v="UI_${t}_BASE_URL"; exp_v="UI_${t}_EXPECT_TEXT"; base="${!base_v:-}"; exp="${!exp_v:-}"
+  [ -n "$base" ] || { echo "UI $t — $base_v not set in profile"; fail=1; continue; }
+  code=$(curl -s -m 10 -L -o /tmp/qa-ui.$$ -w '%{http_code}' "$base/")
+  if [ "$code" != 200 ]; then echo "UI $t $base — HTTP $code"; fail=1; continue; fi
+  if grep -qiE 'Welcome to nginx|It works!|Apache2 Default Page' /tmp/qa-ui.$$; then
+    echo "UI $t $base — serves a web-server placeholder page, not the app"; fail=1; continue; fi
+  pw="$HOME/.qa-agent/tools/node_modules/playwright/index.mjs"
+  if [ -n "$exp" ] && [ -f "$pw" ]; then
+    out=$(QA_URL="$base/" QA_EXPECT="$exp" QA_PW="$pw" node --input-type=module -e '
+      const { chromium } = await import(process.env.QA_PW);
+      const b = await chromium.launch(); const p = await b.newPage(); const errs = [];
+      p.on("console", m => m.type() === "error" && errs.push("console: " + m.text().slice(0, 120)));
+      p.on("requestfailed", r => errs.push("request failed: " + r.url()));
+      p.on("response", r => r.status() >= 400 && errs.push("HTTP " + r.status() + ": " + r.url()));
+      try {
+        await p.goto(process.env.QA_URL, { waitUntil: "networkidle", timeout: 30000 });
+        await p.getByText(process.env.QA_EXPECT, { exact: false }).first().waitFor({ timeout: 10000 });
+      } catch (e) { errs.unshift("expected text \"" + process.env.QA_EXPECT + "\" not rendered"); }
+      await b.close(); if (errs.length) { console.log(errs.join("; ")); process.exit(1); }' 2>&1)
+    [ $? -eq 0 ] || { echo "UI $t $base — $out"; fail=1; }
+  fi
+done
+rm -f /tmp/qa-ui.$$; exit $fail

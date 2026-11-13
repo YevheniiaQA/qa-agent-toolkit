@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Prune heavy run artefacts, keeping the newest N per target.
+# Usage:  qa-prune [--dry-run] [--keep N] [workspace]
+# Reads keep-list exceptions from KEEP file if present.
+set -euo pipefail
+
+KEEP_DEFAULT=3
+DRY=0
+WS="."
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY=1; shift;;
+    --keep) KEEP_DEFAULT="$2"; shift 2;;
+    *) WS="$1"; shift;;
+  esac
+done
+
+RUNS="$WS/.runs"
+[ -d "$RUNS" ] || { echo "No $RUNS — nothing to prune."; exit 0; }
+
+# Exceptions: one path fragment per line, comments allowed.
+KEEPFILE="$WS/.runs/KEEP"
+is_kept() {
+  [ -f "$KEEPFILE" ] || return 1
+  grep -v '^[[:space:]]*#' "$KEEPFILE" 2>/dev/null | grep -q -F "$1"
+}
+
+total_freed=0
+printf '%-16s %6s %8s %12s\n' TARGET KEPT PRUNED RECLAIMED
+
+for target_dir in "$RUNS"/*/; do
+  [ -d "$target_dir" ] || continue
+  target="$(basename "$target_dir")"
+  [ "$target" = "KEEP" ] && continue
+
+  # Per-target override: RETAIN_RUNS_<target> in the environment
+  var="RETAIN_RUNS_${target//-/_}"
+  keep="${!var:-${RETAIN_RUNS:-$KEEP_DEFAULT}}"
+
+  mapfile -t runs < <(ls -1 "$target_dir" 2>/dev/null | sort -r)
+  kept=0; pruned=0; freed=0
+  for i in "${!runs[@]}"; do
+    run="${runs[$i]}"
+    path="$target_dir$run"
+    [ -d "$path" ] || continue
+    if [ "$i" -lt "$keep" ] || is_kept "$target/$run"; then
+      kept=$((kept+1)); continue
+    fi
+    size=$(du -sk "$path" 2>/dev/null | cut -f1)
+    freed=$((freed + size))
+    if [ "$DRY" -eq 1 ]; then
+      echo "  would remove $target/$run ($((size/1024)) MB)"
+    else
+      rm -rf "$path"
+    fi
+    pruned=$((pruned+1))
+  done
+  total_freed=$((total_freed + freed))
+  printf '%-16s %6s %8s %9s MB\n' "$target" "$kept" "$pruned" "$((freed/1024))"
+done
+
+echo
+echo "Total reclaimed: $((total_freed/1024)) MB"
+[ "$DRY" -eq 1 ] && echo "(dry run — nothing was deleted)"
+echo "Derived history in 05-metrics/ was not touched."

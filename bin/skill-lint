@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""skill-lint — structural checks on every skill, agent source and rule in the toolkit.
+
+Usage: skill-lint [--quiet]     exit 1 on any error; warnings are printed, never fail
+
+  frontmatter   name equals the folder, description present and at most 1024 characters
+  links         a skill named as `x` skill / skill `x`, an agent `qa-*`, and `references/<f>.md`
+                exist; no link to a file outside the toolkit that is not there
+  size          SKILL.md at most 400 lines; a skill with references/ keeps its core at 200
+  shared        "Where run output goes" and "Disabled integrations" point to qa-conventions and
+                do not copy its text (so the copies cannot drift)
+  shape         code fences closed; a self-check is numbered 1..n without gaps
+  rules         every rules/*.mdc has description, and globs or alwaysApply
+Runs from the pre-commit hook (githooks/pre-commit) with qa-build-agents --check.
+"""
+import os, re, sys
+from pathlib import Path
+
+TK = Path(os.environ.get("QA_TOOLKIT_ROOT") or Path(os.path.realpath(__file__)).parent.parent)
+SKILLS = TK / "skills"
+LIMIT, CORE_LIMIT, DESC_LIMIT = 400, 200, 1024
+POINTER = {
+    "Where run output goes": "Follow `qa-conventions` → *Run output*",
+    "Disabled integrations": "Follow `qa-conventions` → *Disabled integrations*",
+}
+COPIED = {  # sentences that live only in qa-conventions
+    "Where run output goes": ["Namespacing by target is what makes retention work",
+                              "Only the last three runs per target are retained"],
+    "Disabled integrations": ["is **disabled on purpose**", "A block from it is the answer, not an obstacle"],
+}
+# kebab names that are not skills even when they appear next to the word "skill"
+NOT_SKILLS = {"qa-agent", "qa-gate", "qa-guard", "qa-event", "qa-pipeline", "qa-critic", "qa-env", "qa-prune",
+              "qa-stage-gate", "qa-test-lint", "skill-lint", "qa-build-agents", "test-results"}
+
+
+def frontmatter(text):
+    m = re.match(r"---\n(.*?)\n---\n", text, re.S)
+    if not m:
+        return None
+    out = {}
+    for line in m.group(1).splitlines():
+        if ":" in line and not line.startswith(" "):
+            k, v = line.split(":", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def sections(text):
+    return {m.group(1).strip(): m.group(2) for m in re.finditer(r"^## ([^\n]+)\n(.*?)(?=^## |\Z)", text, re.M | re.S)}
+
+
+def lint_skill(d, skills, agents, err, warn):
+    f = d / "SKILL.md"
+    if not f.exists():
+        err.append(f"{d.name}: no SKILL.md")
+        return
+    text = f.read_text(encoding="utf-8")
+    fm = frontmatter(text)
+    if fm is None:
+        err.append(f"{d.name}: no frontmatter")
+        return
+    if fm.get("name") != d.name:
+        err.append(f"{d.name}: frontmatter name is {fm.get('name')!r}")
+    desc = fm.get("description", "")
+    if not desc:
+        err.append(f"{d.name}: no description")
+    elif len(desc) > DESC_LIMIT:
+        err.append(f"{d.name}: description is {len(desc)} characters (limit {DESC_LIMIT})")
+    n = text.count("\n")
+    refs = d / "references"
+    if refs.is_dir() and n > CORE_LIMIT:
+        err.append(f"{d.name}: {n} lines; a skill with references/ keeps its core at {CORE_LIMIT}")
+    elif n > LIMIT:
+        err.append(f"{d.name}: {n} lines (limit {LIMIT}); move detail to references/*.md")
+    body = re.sub(r"```.*?```", "", text, flags=re.S)
+    for name in set(re.findall(r"`([a-z][a-z0-9]*(?:-[a-z0-9]+)+)`\s+skill\b", body)) | \
+            set(re.findall(r"\bskills?\s+`([a-z][a-z0-9]*(?:-[a-z0-9]+)+)`", body)):
+        if name not in skills and name not in NOT_SKILLS:
+            err.append(f"{d.name}: names a skill `{name}` that does not exist")
+    for name in set(re.findall(r"`(qa-[a-z]+(?:-[a-z]+)*)`", body)):
+        if name.startswith("qa-") and name not in skills and name not in agents and name not in NOT_SKILLS:
+            err.append(f"{d.name}: names `{name}`, which is neither a skill, an agent nor a toolkit command")
+    for ref in set(re.findall(r"references/([\w.-]+\.md)", text)):
+        if not (refs / ref).exists():
+            err.append(f"{d.name}: references/{ref} does not exist")
+    if refs.is_dir():
+        for r in refs.glob("*.md"):
+            if f"references/{r.name}" not in text:
+                warn.append(f"{d.name}: references/{r.name} is never pointed to from SKILL.md")
+    if text.count("```") % 2:
+        err.append(f"{d.name}: unclosed code fence")
+    secs = sections(text)
+    for head, pointer in POINTER.items():
+        if head in secs and d.name != "qa-conventions":
+            if pointer not in secs[head]:
+                err.append(f"{d.name}: '{head}' does not point to qa-conventions")
+            for s in COPIED[head]:
+                if s in secs[head]:
+                    err.append(f"{d.name}: '{head}' copies qa-conventions text ({s[:40]}…)")
+    for head, body_ in secs.items():
+        if head.startswith("Self-check"):
+            nums = [int(x) for x in re.findall(r"^(\d+)\. ", body_, re.M)]
+            if nums and nums != list(range(1, len(nums) + 1)):
+                err.append(f"{d.name}: self-check numbered {nums}")
+
+
+def lint_rules(err):
+    for f in sorted((TK / "rules").glob("*.mdc")):
+        fm = frontmatter(f.read_text(encoding="utf-8")) or {}
+        if not fm.get("description"):
+            err.append(f"rules/{f.name}: no description")
+        if "globs" not in fm and "alwaysApply" not in fm:
+            err.append(f"rules/{f.name}: neither globs nor alwaysApply")
+
+
+def main(argv):
+    skills = {p.name for p in SKILLS.iterdir() if p.is_dir() and not p.name.startswith(".")}
+    agents = {p.stem for p in (TK / "agents").glob("*.md")}
+    err, warn = [], []
+    for d in sorted(SKILLS.iterdir()):
+        if d.is_dir() and not d.name.startswith("."):
+            lint_skill(d, skills, agents, err, warn)
+    lint_rules(err)
+    for w in warn:
+        print("warn ", w)
+    for e in err:
+        print("ERROR", e)
+    if "--quiet" not in argv or err:
+        print(f"skill-lint: {len(skills)} skills, {len(agents)} agents, {len(err)} errors, {len(warn)} warnings")
+    return 1 if err else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# qa-check-api — health 200 AND one real endpoint returns the expected shape. Silent on success.
+set -uo pipefail
+source "$HOME/.qa-agent/bin/qa-env.sh" && qa_load "${1:-}" || exit 2
+code=$(curl -s -m 10 -o /tmp/qa-api-h.$$ -w '%{http_code}' "$API_HEALTH_URL")
+[ "$code" = 200 ] && grep -q '"UP"' /tmp/qa-api-h.$$ || { echo "API health $API_HEALTH_URL — HTTP $code, body: $(head -c 120 /tmp/qa-api-h.$$)"; rm -f /tmp/qa-api-h.$$; exit 1; }
+rm -f /tmp/qa-api-h.$$
+[ -n "${API_SMOKE_PATH:-}" ] || exit 0
+url="$API_BASE_URL$API_SMOKE_PATH"
+code=$(curl -s -m 10 -o /tmp/qa-api-s.$$ -w '%{http_code}' "$url")
+[ "$code" = 200 ] || { echo "API $url — HTTP $code"; rm -f /tmp/qa-api-s.$$; exit 1; }
+python3 - /tmp/qa-api-s.$$ "$url" "${API_SMOKE_KEYS:-}" <<'PY'
+import json,sys
+f,url,keys=sys.argv[1],sys.argv[2],[k for k in sys.argv[3].split(',') if k]
+try: d=json.load(open(f))
+except Exception as e: sys.exit(f"API {url} — not JSON ({e})")
+items=d if isinstance(d,list) else [d]
+if not items: sys.exit(f"API {url} — empty list, cannot verify shape (seed data missing?)")
+bad=[k for k in keys if any(k not in i for i in items)]
+if bad: sys.exit(f"API {url} — items missing keys: {', '.join(bad)}")
+PY
+rc=$?; rm -f /tmp/qa-api-s.$$; exit $rc

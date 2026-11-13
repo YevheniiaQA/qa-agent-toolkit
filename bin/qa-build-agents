@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""qa-build-agents — build the stage agents for each IDE from toolkit/agents/*.md.
+
+Usage:  qa-build-agents [--check]
+  (default)  write build/claude/agents/<name>.md and build/cursor/agents/<name>.md
+  --check    change nothing; exit 1 if a source is invalid or the build is out of date
+
+A source is one agent: Claude Code frontmatter (name, description, model, skills,
+disallowedTools, color; `skillsChoice: one` when the delegation prompt names which one
+of the listed skills to run; `scope: project` for an agent whose gate files go under
+02-analysis/_project) and a body with one {{skills}} line. `{{include:NAME}}` pastes
+agents/_partials/NAME.md, the sections every stage agent shares; `{{agent}}` and
+`{{ticket}}` (`_project` or `<TICKET>`) are filled in. Every agent also gets `qa-conventions`
+(preloaded in Claude Code, read on demand in Cursor). `cursorModel` sets the Cursor model
+(for a critic: a model of another vendor). Per IDE:
+  claude  frontmatter as written; {{skills}} says the skills are preloaded above
+  cursor  name, description, model only (haiku -> fast); {{skills}} tells the agent to
+          read each skill's SKILL.md from ~/.cursor/skills first, since Cursor does not
+          preload skills, and not to start subagents (no disallowedTools there)
+install.sh links the built files into ~/.claude/agents and ~/.cursor/agents.
+"""
+import os, re, sys
+
+TK = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+SRC = os.path.join(TK, "agents")
+OUT = os.path.join(TK, "build")
+IDES = ("claude", "cursor")
+CURSOR_MODEL = {"haiku": "fast", "inherit": "inherit"}   # anything else: inherit
+REQUIRED = ("name", "description", "model", "skills")
+BUILD_ONLY = {"skillsChoice", "scope", "cursorModel"}
+CONVENTIONS = "qa-conventions"                  # shared rules every stage agent gets          # read by this script, not by an IDE
+PARTIALS = os.path.join(SRC, "_partials")
+
+
+def expand(name, fm, body):
+    def include(m):
+        with open(os.path.join(PARTIALS, m.group(1) + ".md"), encoding="utf-8") as fh:
+            return fh.read().rstrip("\n")
+    body = re.sub(r"\{\{include:([a-z0-9-]+)\}\}", include, body)
+    ticket = "_project" if fm.get("scope") == "project" else "<TICKET>"
+    return body.replace("{{agent}}", name).replace("{{ticket}}", ticket)
+
+
+def parse(path):
+    text = open(path, encoding="utf-8").read()
+    m = re.match(r"---\n(.*?)\n---\n(.*)\Z", text, re.S)
+    if not m:
+        raise ValueError("no frontmatter")
+    fm, key = {}, None
+    for line in m.group(1).splitlines():
+        if re.match(r"\s+- ", line) and key:
+            fm.setdefault(key, []).append(line.split("- ", 1)[1].strip())
+        elif ":" in line:
+            key, val = (p.strip() for p in line.split(":", 1))
+            fm[key] = val if val else []
+    return fm, m.group(2)
+
+
+def skills_line(ide, skills, choice):
+    names = " and ".join(f"`{s}`" for s in skills)
+    one = len(skills) == 1
+    if choice == "one":
+        if ide == "claude":
+            return (f"Your instructions are the one skill of {' or '.join(f'`{s}`' for s in skills)} "
+                    f"(both preloaded above) that the delegation prompt names: follow it exactly as written.")
+        return (f"Your instructions are the one skill of {' or '.join(f'`{s}`' for s in skills)} that "
+                f"the delegation prompt names. Before anything else, read only that skill's "
+                f"`~/.cursor/skills/<skill>/SKILL.md` in full, then follow it exactly as written. "
+                f"You are a subagent: do not start other subagents.")
+    if ide == "claude":
+        return (f"Your instructions are the skill{'' if one else 's'} {names}, preloaded above: "
+                f"follow {'it' if one else 'them'} exactly as written.")
+    paths = ", ".join(f"`~/.cursor/skills/{s}/SKILL.md`" for s in skills)
+    return (f"Your instructions are the skill{'' if one else 's'} {names}. Before anything else, "
+            f"read {paths} in full (and a file under its `references/` when the skill points "
+            f"to one), then follow {'it' if one else 'them'} exactly as written. You are a "
+            f"subagent: do not start other subagents.")
+
+
+def render(ide, name, fm, body):
+    if ide == "claude":
+        head = []
+        for k, v in fm.items():
+            if k in BUILD_ONLY:
+                continue
+            if k == "skills":
+                v = v + [CONVENTIONS] if CONVENTIONS not in v else v
+            head += [f"{k}:"] + [f"  - {x}" for x in v] if isinstance(v, list) else [f"{k}: {v}"]
+    else:
+        head = [f"name: {fm['name']}", f"description: {fm['description']}",
+                f"model: {fm.get('cursorModel') or CURSOR_MODEL.get(fm['model'], 'inherit')}"]
+    note = f"<!-- built by qa-build-agents from ~/.qa-agent/toolkit/agents/{name}.md: edit there -->"
+    body = expand(name, fm, body)
+    conv = ("The shared rules the skills point to (`qa-conventions`) are preloaded above too." if ide == "claude" else
+            "When a skill points to `qa-conventions`, read `~/.cursor/skills/qa-conventions/SKILL.md`.")
+    body = body.replace("{{skills}}", "{{skills}} " + conv, 1)
+    return "---\n" + "\n".join(head) + "\n---\n" + note + "\n" + body.replace("{{skills}}", skills_line(ide, fm["skills"], fm.get("skillsChoice")))
+
+
+def main(argv):
+    check = "--check" in argv
+    errors, stale, built = [], [], 0
+    for f in sorted(os.listdir(SRC)):
+        if not f.endswith(".md"):
+            continue
+        name = f[:-3]
+        try:
+            fm, body = parse(os.path.join(SRC, f))
+        except ValueError as e:
+            errors.append(f"{f}: {e}"); continue
+        missing = [k for k in REQUIRED if not fm.get(k)]
+        if missing:
+            errors.append(f"{f}: missing {', '.join(missing)}"); continue
+        if fm["name"] != name:
+            errors.append(f"{f}: name is {fm['name']}, file is {name}")
+        missing_inc = [i for i in re.findall(r"\{\{include:([a-z0-9-]+)\}\}", body)
+                       if not os.path.isfile(os.path.join(PARTIALS, i + ".md"))]
+        if missing_inc:
+            errors.append(f"{f}: no partial {', '.join(missing_inc)}"); continue
+        if expand(name, fm, body).count("{{skills}}") != 1:
+            errors.append(f"{f}: needs exactly one {{{{skills}}}} line")
+        for s in fm["skills"]:
+            if not os.path.isfile(os.path.join(TK, "skills", s, "SKILL.md")):
+                errors.append(f"{f}: skill {s} is not in toolkit/skills")
+        for ide in IDES:
+            dst = os.path.join(OUT, ide, "agents", f)
+            text = render(ide, name, fm, body)
+            old = open(dst, encoding="utf-8").read() if os.path.exists(dst) else None
+            if old == text:
+                continue
+            stale.append(os.path.relpath(dst, TK))
+            if not check:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                with open(dst, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+        built += 1
+    for ide in IDES:   # built files whose source is gone
+        d = os.path.join(OUT, ide, "agents")
+        for f in (os.listdir(d) if os.path.isdir(d) else []):
+            if not os.path.exists(os.path.join(SRC, f)):
+                stale.append(os.path.relpath(os.path.join(d, f), TK))
+                if not check:
+                    os.remove(os.path.join(d, f))
+    for e in errors:
+        print("ERROR", e, file=sys.stderr)
+    if check:
+        for s in stale:
+            print("STALE", s)
+        print(f"{built} agents, {len(errors)} errors, {len(stale)} stale")
+        return 1 if errors or stale else 0
+    print(f"{built} agents built for {', '.join(IDES)}: {len(stale)} files changed")
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

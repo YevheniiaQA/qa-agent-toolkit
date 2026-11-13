@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# qa-check-db — connects as the profile's DB_USER, runs SELECT 1, and FAILS if the role can
+# write (superuser, or INSERT/UPDATE/DELETE on any table). Silent on success.
+set -uo pipefail
+source "$HOME/.qa-agent/bin/qa-env.sh" && qa_load "${1:-}" || exit 2
+[ -n "${DB_USER:-}" ] || { echo "DB — DB_USER not set in profile"; exit 1; }
+sql="select 1;
+select rolsuper from pg_roles where rolname=current_user;
+select count(*) from pg_class c join pg_namespace n on n.oid=c.relnamespace
+  where n.nspname='public' and c.relkind in ('r','p')
+  and (has_table_privilege(c.oid,'INSERT') or has_table_privilege(c.oid,'UPDATE') or has_table_privilege(c.oid,'DELETE'));
+select count(*) from pg_class c join pg_namespace n on n.oid=c.relnamespace
+  where n.nspname='public' and c.relkind in ('r','p') and has_table_privilege(c.oid,'SELECT');
+show default_transaction_read_only;"
+if command -v psql >/dev/null; then
+  out=$(PGPASSWORD="${DB_PASSWORD:-}" PGCONNECT_TIMEOUT=5 psql -h "$DB_HOST" -p "${DB_PORT:-5432}" -U "$DB_USER" -d "$DB_NAME" -tAX -c "$sql" 2>&1)
+elif [ -n "${DB_CONTAINER:-}" ]; then
+  out=$(docker exec -e PGPASSWORD="${DB_PASSWORD:-}" "$DB_CONTAINER" psql -h localhost -U "$DB_USER" -d "$DB_NAME" -tAX -c "$sql" 2>&1)
+else
+  echo "DB — no psql on host and no DB_CONTAINER in profile"; exit 1
+fi
+[ $? -eq 0 ] || { echo "DB $DB_USER@$DB_HOST/$DB_NAME — $(echo "$out" | head -2 | tr '\n' ' ')"; exit 1; }
+{ read -r one; read -r super; read -r writable; read -r tables; read -r ro; } <<<"$out"
+[ "$one" = 1 ] || { echo "DB — SELECT 1 returned '$one'"; exit 1; }
+[ "$super" = f ] || { echo "DB — role $DB_USER is SUPERUSER (must be read-only)"; exit 1; }
+[ "$writable" = 0 ] || { echo "DB — role $DB_USER can write to $writable table(s)"; exit 1; }
+[ "$tables" -gt 0 ] || { echo "DB — role $DB_USER can SELECT 0 tables in public (grants missing?)"; exit 1; }
+[ "$ro" = on ] || { echo "DB — default_transaction_read_only=$ro for $DB_USER (expected on)"; exit 1; }

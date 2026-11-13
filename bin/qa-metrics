@@ -1,0 +1,490 @@
+#!/usr/bin/env python3
+"""qa-metrics — QA metrics for one workspace, computed from its files, never typed in.
+
+Usage: qa-metrics [--root DIR] [--since YYYY-MM-DD] [--json | --html [DIR]]
+
+Reads 05-metrics/events.jsonl (qa-event, qa-gate --write, the qa-stage-gate hook),
+bugs/*.md, 02-analysis/<T>/requirements/_index.json and OPEN_QUESTIONS.md,
+02-analysis/<T>/scenarios/*.json, 03-tests/**/TRACEABILITY.json, 04-results/*/sessions/*.md
+and the current hashes of artefacts the pipeline recorded. Every number carries its
+numerator, denominator and source; a metric with no data says `n/a` and what would produce it.
+
+  defects      found, by severity, where caught, DDP, leakage, rejection, reopen, ageing
+  requirements stories, requirements, findings, open questions per story
+  coverage     requirements with a scenario, with an automated test, waived
+  manual       SBTM sessions: hours, setup / test / bug split, findings per session
+  automation   per suite: runs, clean runs, inconsistent tests, runtime, false failure rate,
+               mutation score; older summaries cross-checked against the raw reports
+  pipeline     first-pass gate rate, mechanical gate first-run pass rate, stage cost and
+               duration, human edit rate, decisions taken by silent consent
+
+--html writes one page per metric of metrics/catalog.json (what it is, how it is computed, how
+often to look at it, its value here and the rows behind it) and index.html, into DIR or
+05-metrics/. It replaces only pages it generated before.
+"""
+import argparse, datetime, json, os, re, statistics, sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import qa_events  # noqa: E402
+from qa_metric_values import mutation_passes, ratio  # noqa: E402
+
+PHASE_OF = [  # found-by text -> phase where the defect was caught
+    (r"production|customer|support|after release|\bprod\b", "production"),
+    (r"exploratory|session|\bCH-\d+", "exploratory"),
+    (r"manual|test-execution|tester", "manual"),
+    (r"requirements|decompos|ticket-fetch|discrepanc|refinement", "requirements"),
+    (r"scenario|figma|design|test-plan", "design"),
+    (r"suite|automation|selectors|debugger|contract|perf|security|regression|TC-", "automation"),
+]
+STATE_OF = [(r"reopen", "reopened"), (r"reject|not a bug|duplicate|works as (designed|intended)|invalid|won.?t fix", "rejected"),
+            (r"verif", "verified"), (r"clos", "closed"), (r"fix|resolv", "fixed"), (r"open|new|confirm|triag", "open")]
+
+
+def fmt(r, unit="%"):
+    if r["value"] is None:
+        return f"n/a ({r['note']})" if r.get("note") else "n/a"
+    return f"{r['value']}{unit} ({r['num']}/{r['den']})" + (f" — {r['note']}" if r.get("note") else "")
+
+
+def rel(root, p):
+    return str(Path(p).relative_to(root))
+
+
+# ---------------------------------------------------------------- defects
+
+def parse_defect(path):
+    text = path.read_text(encoding="utf-8", errors="replace")
+    fields = {}
+    fm = re.match(r"---\n(.*?)\n---\n", text, re.S)
+    if fm:
+        for line in fm.group(1).splitlines():
+            if ":" in line:
+                k, v = line.split(":", 1)
+                fields[k.strip().lower()] = v.strip()
+    for k, v in re.findall(r"^\|\s*([A-Za-z ]+?)\s*\|\s*(.+?)\s*\|\s*$", text, re.M):
+        fields.setdefault(k.strip().lower(), v)
+    status = fields.get("status", "")
+    state = next((s for pat, s in STATE_OF if re.search(pat, status, re.I)), "open" if status else None)
+    sev = re.sub(r"[*_`]", "", fields.get("severity", "")).split(":")[0].split()[:1]
+    found_by = (re.search(r"\bby\s+(.+)$", status) or re.search(r"(.+)", fields.get("found by", "") or " ")).group(1).strip()
+    date = re.search(r"\d{4}-\d{2}-\d{2}", status + " " + fields.get("found", ""))
+    phase = (fields.get("phase") or "").lower() or next(
+        (ph for pat, ph in PHASE_OF if re.search(pat, found_by, re.I)), None)
+    yes = lambda k: bool(re.match(r"\s*[*_`]*\s*(yes|y|true|так)\b", fields.get(k, ""), re.I))
+    return {"id": path.stem, "severity": sev[0].lower() if sev else None, "state": state, "phase": phase,
+            "foundBy": found_by or None, "found": date.group(0) if date else None, "source": str(path),
+            "customerImpact": yes("customer impact"), "regression": yes("regression")}
+
+
+def defects(root, events, since=None):
+    items = {}
+    for f in sorted((root / "bugs").glob("*.md")) if (root / "bugs").is_dir() else []:
+        items[f.stem] = parse_defect(f)
+    history = defaultdict(list)
+    for ev in sorted((e for e in events if e.get("kind") == "defect"), key=lambda e: e.get("ts") or ""):
+        history[ev["id"]].append(ev["state"])
+        d = items.setdefault(ev["id"], {"id": ev["id"], "source": "events.jsonl"})
+        d["state"] = ev["state"]
+        for k in ("severity", "phase", "customerImpact", "regression"):
+            if ev.get(k):
+                d[k] = ev[k]
+        if ev["state"] == "open" and not d.get("opened"):
+            d["opened"] = ev["ts"]
+            if not d.get("found"):
+                d["found"] = ev["ts"][:10]
+        if ev["state"] in ("fixed", "verified", "closed") and not d.get("fixedAt"):
+            d["fixedAt"] = ev["ts"]
+    if since:   # a sprint or release: defects found in it (one with no date stays, and is counted)
+        items = {k: d for k, d in items.items() if not d.get("found") or d["found"] >= since}
+    total = len(items)
+    rejected = sum(d.get("state") == "rejected" for d in items.values())
+    valid = [d for d in items.values() if d.get("state") != "rejected"]
+    escaped = sum(d.get("phase") == "production" for d in valid)
+    fixed_ever = [i for i, d in items.items() if d.get("state") in ("fixed", "verified", "closed", "reopened")
+                  or {"fixed", "verified", "closed"} & set(history[i])]
+    reopened = [i for i in fixed_ever if items[i].get("state") == "reopened" or "reopened" in history[i]]
+    today = datetime.date.today()
+    ageing = defaultdict(list)
+    for d in valid:
+        if d.get("state") in ("open", "reopened") and d.get("found"):
+            ageing[d.get("severity") or "unknown"].append((today - datetime.date.fromisoformat(d["found"])).days)
+    no_prod = "no defect is recorded as found in production; an upper bound until production defects are filed here" \
+        if not escaped else ""
+    return {
+        "found": total, "bySeverity": dict(Counter(d.get("severity") or "unknown" for d in valid)),
+        "whereCaught": dict(Counter(d.get("phase") or "unknown" for d in valid)),
+        "ddp": ratio(len(valid) - escaped, len(valid), no_prod),
+        "leakage": ratio(escaped, len(valid), no_prod),
+        "rejectionRate": ratio(rejected, total),
+        "reopenRate": ratio(len(reopened), len(fixed_ever), "no defect has been fixed yet" if not fixed_ever else ""),
+        "openAgeDays": {k: {"open": len(v), "maxDays": max(v), "medianDays": statistics.median(v)} for k, v in ageing.items()},
+        "sources": sorted({d["source"] if d["source"] == "events.jsonl" else rel(root, d["source"]) for d in items.values()}),
+        "items": [dict(d, source=d["source"] if d["source"] == "events.jsonl" else rel(root, d["source"]))
+                  for d in items.values()],
+    }
+
+
+# ---------------------------------------------------------------- requirements, coverage, questions
+
+def tickets(root):
+    return sorted(p.parent.parent for p in (root / "02-analysis").glob("*/requirements/_index.json"))
+
+
+def load(path, default=None):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return default
+
+
+def scenario_suites(tdir):
+    for f in sorted((tdir / "scenarios").glob("*.json")):
+        doc = load(f, {})
+        suite = doc.get("testSuite", doc) if isinstance(doc, dict) else {}
+        if isinstance(suite, dict) and isinstance(suite.get("testCases"), list):
+            yield f, suite
+
+
+def automated_requirements(root):
+    out = set()
+    for f in (root / "03-tests").rglob("TRACEABILITY.json") if (root / "03-tests").is_dir() else []:
+        if "node_modules" in f.parts:
+            continue
+        for row in load(f, []) or []:
+            if isinstance(row, dict):
+                out.update(row.get("requirementIds") or [])
+    return out
+
+
+def answered_questions(tdir, events, ticket):
+    """Q-ids an engineer answered: an `Answer` line under the question, or a decision event by engineer."""
+    out = set()
+    oq = tdir / "requirements" / "OPEN_QUESTIONS.md"
+    if oq.exists():
+        current = None
+        for line in oq.read_text(encoding="utf-8").splitlines():
+            m = re.match(r"^- \*\*(Q-\d+)\*\*", line)
+            if m:
+                current = m.group(1)
+            elif current and re.match(r"^\s+- \*?\*?(Answer|Answered|Decision|Decided)\b", line, re.I):
+                out.add(current)
+    for ev in events:
+        if ev.get("kind") == "decision" and ev.get("by") == "engineer" and ev.get("ticket") in (ticket, None):
+            out.add(ev["id"])
+    return out
+
+
+def requirements_and_coverage(root, events):
+    automated = automated_requirements(root)
+    per_ticket, totals = {}, Counter()
+    consent = Counter()
+    for tdir in tickets(root):
+        t = tdir.name
+        idx = load(tdir / "requirements" / "_index.json", {})
+        reqs = [r for r in idx.get("requirements", []) if isinstance(r, dict)]
+        ids = {r["id"] for r in reqs if r.get("id")}
+        scen_reqs, waived, scen_text, cases = set(), set(), "", 0
+        for f, suite in scenario_suites(tdir):
+            scen_text += f.read_text(encoding="utf-8")
+            cases += len(suite["testCases"])
+            for tc in suite["testCases"]:
+                scen_reqs.update((tc.get("traceability") or {}).get("requirementIds") or tc.get("requirementIds") or [])
+            waived.update(w.get("requirementId") for w in suite.get("nfrWaivers") or [] if isinstance(w, dict))
+        questions = [q for q in idx.get("openQuestions", []) if isinstance(q, dict)]
+        answered = answered_questions(tdir, events, t) & {q["id"] for q in questions}
+        defaults = {ev["id"] for ev in events if ev.get("kind") == "decision" and ev.get("by") == "default"
+                    and ev.get("ticket") in (t, None)}
+        acted = [q["id"] for q in questions
+                 if q["id"] in defaults or re.search(rf"\b{re.escape(q['id'])}\b", scen_text)
+                 or set(q.get("blocks") or []) & scen_reqs]
+        silent = [q for q in acted if q not in answered]
+        consent.update(acted=len(acted), silent=len(silent), questions=len(questions), answered=len(answered))
+        stories = len(idx.get("stories", []))
+        row = {
+            "stories": stories, "tasks": len(idx.get("tasks", [])), "requirements": len(ids),
+            "acceptanceCriteria": len(idx.get("acceptanceCriteria", [])), "scenarios": cases,
+            "requirementStatus": dict(Counter(r.get("status") or "unknown" for r in reqs)),
+            "findings": len({r["finding"] for r in reqs if r.get("finding")}),
+            "openQuestions": len(questions), "questionsPerStory": round(len(questions) / stories, 2) if stories else None,
+            "withScenario": ratio(len(ids & scen_reqs), len(ids)),
+            "automated": ratio(len(ids & automated), len(ids)),
+            "waived": len(ids & waived),
+            "uncovered": sorted(ids - scen_reqs - waived)[:10],
+            "silentConsent": silent,
+        }
+        per_ticket[t] = row
+        totals.update(requirements=len(ids), withScenario=len(ids & scen_reqs), automated=len(ids & automated),
+                      waived=len(ids & waived), questions=len(questions), stories=stories, findings=row["findings"])
+    return per_ticket, totals, consent
+
+
+# ---------------------------------------------------------------- manual / exploratory
+
+def sessions(root, events):
+    recorded = {ev.get("source"): ev for ev in events if ev.get("kind") == "session"}
+    found = dict(recorded)
+    for f in sorted(root.glob("04-results/*/sessions/*.md")):
+        r = rel(root, f)
+        if f.name.upper().startswith("CHARTER") or r in found:
+            continue
+        try:
+            found[r] = qa_events.parse_session(f)
+        except (OSError, ValueError):
+            continue
+    charters = set()
+    for f in root.glob("04-results/*/sessions/CHARTERS.md"):
+        charters.update(re.findall(r"\bCH-\d+\b", f.read_text(encoding="utf-8")))
+    if not found:
+        return {"sessions": 0, "note": "no session sheets under 04-results/*/sessions/ (exploratory-testing writes them)",
+                "charters": len(charters)}
+    secs = sum(s.get("durationS") or 0 for s in found.values())
+    split = Counter()
+    for s in found.values():
+        split.update(s.get("split") or {})
+    tot = sum(split.values())
+    findings = sum((s.get("counts") or {}).get("findings", 0) for s in found.values())
+    return {"sessions": len(found), "hours": round(secs / 3600, 2), "charters": len(charters),
+            "chartersRun": ratio(len({s.get("id") for s in found.values()} & charters), len(charters)),
+            "split": {k: ratio(v, tot) for k, v in split.items()} if tot else None,
+            "findingsPerSession": round(findings / len(found), 2)}
+
+
+# ---------------------------------------------------------------- automation
+
+def automation(root, events):
+    runs = defaultdict(list)
+    for ev in events:
+        if ev.get("kind") == "run":
+            runs[ev["suite"]].append(ev)
+    triage = {(ev.get("suite"), ev["test"]): ev["class"] for ev in events if ev.get("kind") == "triage"}
+    triage_any = {ev["test"]: ev["class"] for ev in events if ev.get("kind") == "triage"}
+    out, ff_num, ff_den, unclassified = {}, 0, 0, 0
+    for suite, rs in sorted(runs.items()):
+        rs.sort(key=lambda e: e.get("ts") or "")
+        bad = defaultdict(int)
+        for r in rs:
+            for tid in (r.get("outcomes") or {}):
+                bad[tid] += 1
+        inconsistent = sorted(t for t, n in bad.items() if n < len(rs))
+        false = 0
+        for r in rs:
+            for tid, st in (r.get("outcomes") or {}).items():
+                if st == "skipped":
+                    continue
+                ff_den += 1
+                cls = triage.get((suite, tid)) or triage_any.get(tid)
+                if cls:
+                    false += cls != "product-defect"
+                elif st == "flaky" or tid in inconsistent:
+                    false += 1
+                else:
+                    unclassified += 1
+        ff_num += false
+        durs = [r.get("durationS") for r in rs if r.get("durationS") is not None]
+        last = rs[-1]
+        out[suite] = {
+            "runs": len(rs), "cleanRuns": ratio(sum(1 for r in rs if not r.get("unexpected") and not r.get("flaky")), len(rs)),
+            "tests": last.get("tests"), "expectedFailures": last.get("expectedFail"),
+            "inconsistentTests": inconsistent,
+            "durationS": {"median": round(statistics.median(durs), 2), "first": durs[0], "last": durs[-1]} if durs else None,
+            "period": [rs[0].get("ts", "")[:10], last.get("ts", "")[:10]],
+        }
+    mutation = {s: ratio(p["killed"], p["mutants"]) for s, p in mutation_passes(events).items()}
+    note = "no failing test runs recorded" if not ff_den else (
+        f"{unclassified} failure(s) not classified (qa-event triage)" if unclassified else
+        "a failure counts as false when triage says test-bug / environment / data, or the test passed in another run")
+    summaries = defaultdict(list)       # older hand-written run summaries, by suite and day
+    for ev in events:
+        if ev.get("kind") == "counts" and ev.get("stage") == "test-run" and ev.get("suite") in runs:
+            summaries[(ev["suite"], (ev.get("ts") or "")[:10])].append(ev)
+    legacy = []
+    for (suite, day), evs in sorted(summaries.items()):
+        raw = [r for r in runs[suite] if (r.get("ts") or "")[:10] == day]
+        said_runs = sum((e.get("counts") or {}).get("runs") or 0 for e in evs)
+        said_tests = {(e.get("counts") or {}).get("tests") for e in evs} - {None}
+        legacy.append({"suite": suite, "day": day, "lines": [e.get("migratedFrom") for e in evs],
+                       "saysRuns": said_runs, "rawReports": len(raw),
+                       "rawFiles": sorted(os.path.basename(r.get("source") or "") for r in raw),
+                       "testsAgree": said_tests <= {r.get("tests") for r in raw if r.get("tests")} if said_tests else None})
+    return {"suites": out, "falseFailureRate": ratio(ff_num, ff_den, note),
+            "mutationScore": mutation or {"note": "no mutation pass recorded (test-debugger: qa-event mutation)"},
+            "legacyCrossCheck": legacy}
+
+
+# ---------------------------------------------------------------- pipeline
+
+def pipeline(root, events, consent):
+    stages = [ev for ev in events if ev.get("kind") == "stage"]
+    by_run = defaultdict(list)
+    for ev in stages:
+        if ev.get("runId"):
+            by_run[(ev["runId"], ev.get("stage"))].append(ev)
+    when = lambda e: e.get("corrects") or e.get("ts")      # a correction stands where the line it replaced stood
+    first = [sorted(v, key=when)[0] for v in by_run.values()]
+    first_pass = ratio(sum(e.get("decision") == "allow" for e in first), len(first),
+                       "" if first else "no stage agent has stopped since events were recorded")
+    gates = defaultdict(list)
+    for ev in events:
+        if ev.get("kind") == "gate":
+            gates[(ev.get("ticket"), ev.get("stage"), ev.get("command"))].append(ev)
+    gate_first = ratio(sum(sorted(v, key=lambda e: e["ts"])[0]["exitCode"] == 0 for v in gates.values()), len(gates),
+                       "" if gates else "no `qa-gate … --write` run recorded yet")
+    cost = defaultdict(lambda: {"runs": 0, "tokensOut": 0, "tokensIn": 0, "costUsd": 0.0, "durations": [], "models": Counter(), "unpriced": 0})
+    per_agent_run = defaultdict(list)   # one agent run may cover several stages (qa-manual, qa-sync): count it once
+    for (run_id, stage), evs in by_run.items():
+        per_agent_run[run_id] += evs
+    for run_id, evs in per_agent_run.items():
+        evs.sort(key=when)
+        last = evs[-1]                                       # usage is cumulative per run
+        names = list(dict.fromkeys(e.get("stage") for e in evs))
+        c = cost[" + ".join(names)]
+        c["runs"] += 1
+        tok = last.get("tokens") or {}
+        c["tokensOut"] += tok.get("out", 0)
+        c["tokensIn"] += tok.get("in", 0) + tok.get("cacheRead", 0) + tok.get("cacheWrite", 0)
+        if last.get("costUsd") is None:
+            c["unpriced"] += 1
+        else:
+            c["costUsd"] += last["costUsd"]
+        if last.get("durationS") is not None:
+            c["durations"].append(last["durationS"])
+        c["models"][last.get("model")] += 1
+    stage_cost = {s: {"runs": c["runs"], "tokensIn": c["tokensIn"], "tokensOut": c["tokensOut"],
+                      "costUsd": round(c["costUsd"], 4), "costPerRun": round(c["costUsd"] / c["runs"], 4),
+                      "unpricedRuns": c["unpriced"],
+                      "medianDurationS": round(statistics.median(c["durations"]), 1) if c["durations"] else None,
+                      "model": c["models"].most_common(1)[0][0]} for s, c in cost.items()}
+    latest = {}
+    for ev in sorted(stages, key=lambda e: e.get("ts")):
+        for path, sha in (ev.get("artefacts") or {}).items():
+            latest[path] = sha
+    tracked = edited = 0
+    edited_paths = []
+    for path, sha in latest.items():
+        f = root / path
+        if not f.is_file():
+            continue
+        tracked += 1
+        if qa_events.sha256(f) != sha:
+            edited += 1
+            edited_paths.append(path)
+    human = ratio(edited, tracked, "artefacts changed after the pipeline last recorded them (by a person or a tool "
+                                   "outside the pipeline)" if tracked else "no artefact hashes recorded yet")
+    status = Counter(ev.get("status") for ev in stages)
+    return {"firstPassGateRate": first_pass, "mechanicalFirstRunPass": gate_first, "stageCost": stage_cost
+            or {"note": "no stage agent with a transcript has stopped since events were recorded"},
+            "humanEditRate": human, "editedArtefacts": edited_paths[:10], "stageEvents": dict(status),
+            "silentConsent": ratio(consent["silent"], consent["acted"],
+                                   "open questions whose proposed default is already asserted by a scenario, "
+                                   "with no recorded engineer answer" if consent["acted"] else "no open question acted on")}
+
+
+# ---------------------------------------------------------------- output
+
+def report(m):
+    L = []
+    s = m["sources"]
+    L.append(f"# QA metrics — {m['project']} — {m['generatedAt'][:16]}")
+    L.append(f"events: {s['events']} ({', '.join(f'{k} {v}' for k, v in s['byKind'].items())})"
+             + (f" · {s['unreadable']} unreadable line(s)" if s["unreadable"] else ""))
+    d = m["defects"]
+    L += ["", "## Defects", f"found {d['found']} · by severity {d['bySeverity']} · where caught {d['whereCaught']}",
+          f"DDP {fmt(d['ddp'])}", f"leakage {fmt(d['leakage'])}", f"rejection rate {fmt(d['rejectionRate'])}",
+          f"reopen rate {fmt(d['reopenRate'])}"]
+    for sev, a in d["openAgeDays"].items():
+        L.append(f"open {sev}: {a['open']}, oldest {a['maxDays']} days, median {a['medianDays']}")
+    L.append(f"sources: {', '.join(d['sources']) or 'none'}")
+    L += ["", "## Requirements and coverage"]
+    for t, r in m["tickets"].items():
+        L.append(f"{t}: {r['stories']} stories · {r['requirements']} reqs ({', '.join(f'{k} {v}' for k, v in r['requirementStatus'].items())})"
+                 f" · {r['findings']} findings · {r['openQuestions']} open questions ({r['questionsPerStory']}/story)"
+                 f" · with scenario {fmt(r['withScenario'])} · automated {fmt(r['automated'])} · waived {r['waived']}")
+        if r["uncovered"]:
+            L.append(f"  no scenario and not waived: {', '.join(r['uncovered'])}")
+    tt = m["totals"]
+    if tt.get("requirements"):
+        L.append(f"all tickets: with scenario {fmt(ratio(tt['withScenario'], tt['requirements']))} · automated "
+                 f"{fmt(ratio(tt['automated'], tt['requirements']))} · open questions per story "
+                 f"{round(tt['questions'] / tt['stories'], 2) if tt['stories'] else 'n/a'}")
+    x = m["manual"]
+    L += ["", "## Manual and exploratory (SBTM)"]
+    if not x.get("sessions"):
+        L.append(f"n/a ({x['note']}); charters planned: {x['charters']}")
+    else:
+        split = " · ".join(f"{k} {fmt(v)}" for k, v in (x["split"] or {}).items())
+        L.append(f"{x['sessions']} sessions, {x['hours']} h · charters run {fmt(x['chartersRun'])} · {split} · "
+                 f"{x['findingsPerSession']} findings/session")
+    a = m["automation"]
+    L += ["", "## Automation"]
+    for suite, r in a["suites"].items():
+        dur = r["durationS"]
+        L.append(f"{suite}: {r['runs']} runs {r['period'][0]}…{r['period'][1]} · clean {fmt(r['cleanRuns'])} · "
+                 f"{r['tests']} tests, {r['expectedFailures']} expected failures · runtime median {dur['median']}s "
+                 f"(first {dur['first']}s, last {dur['last']}s)" + (f" · inconsistent: {', '.join(r['inconsistentTests'])}"
+                                                                    if r["inconsistentTests"] else ""))
+    L.append(f"false failure rate {fmt(a['falseFailureRate'])}")
+    ms = a["mutationScore"]
+    L.append("mutation score " + (f"n/a ({ms['note']})" if "note" in ms else " · ".join(f"{k} {fmt(v)}" for k, v in ms.items())))
+    for c in a["legacyCrossCheck"]:
+        extra = [f for f in c["rawFiles"] if not f.startswith("run-")]
+        L.append(f"cross-check {c['suite']} {c['day']}: older summary ({', '.join(c['lines'])}) says {c['saysRuns']} runs, "
+                 f"raw reports {c['rawReports']}" + (f" (incl. {', '.join(extra)})" if extra else "")
+                 + f"; runs agree: {'yes' if c['saysRuns'] == c['rawReports'] else 'no'}"
+                 + ("" if c["testsAgree"] is None else f"; test count agrees: {'yes' if c['testsAgree'] else 'NO'}"))
+    p = m["pipeline"]
+    L += ["", "## AI pipeline", f"first-pass gate rate {fmt(p['firstPassGateRate'])}",
+          f"mechanical gate passed on first run {fmt(p['mechanicalFirstRunPass'])}",
+          f"human edit rate {fmt(p['humanEditRate'])}" + (f": {', '.join(p['editedArtefacts'])}" if p["editedArtefacts"] else ""),
+          f"decisions by silent consent {fmt(p['silentConsent'])}"]
+    silent = {t: r["silentConsent"] for t, r in m["tickets"].items() if r["silentConsent"]}
+    if silent:
+        L.append("  " + " · ".join(f"{t}: {', '.join(q)}" for t, q in silent.items()))
+    sc = p["stageCost"]
+    if "note" in sc:
+        L.append(f"stage cost n/a ({sc['note']})")
+    for stage, c in sc.items() if "note" not in sc else []:
+        L.append(f"stage cost {stage}: {c['runs']} run(s), ${c['costUsd']} (${c['costPerRun']}/run, {c['model']}), "
+                 f"{c['tokensIn']} in / {c['tokensOut']} out tokens, median {c['medianDurationS']}s"
+                 + (f", {c['unpricedRuns']} without a price" if c["unpricedRuns"] else ""))
+    L.append(f"stage events by status: {p['stageEvents'] or 'none'}")
+    return "\n".join(L)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--root")
+    ap.add_argument("--since", help="only events on or after this date (YYYY-MM-DD)")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--html", nargs="?", const="", metavar="DIR", help="pages per metric (default 05-metrics/)")
+    a = ap.parse_args()
+    root = Path(a.root).resolve() if a.root else qa_events.find_root(os.getcwd())
+    if not root:
+        print("qa-metrics: no .qa-project above $PWD; pass --root", file=sys.stderr)
+        return 2
+    events, bad = qa_events.read(root)
+    if a.since:
+        events = [e for e in events if (e.get("ts") or "") >= a.since]
+    per_ticket, totals, consent = requirements_and_coverage(root, events)
+    m = {"project": qa_events.project_of(root), "generatedAt": qa_events.now(),
+         "sources": {"events": len(events), "unreadable": bad, "byKind": dict(Counter(e.get("kind") for e in events))},
+         "defects": defects(root, events, a.since), "tickets": per_ticket, "totals": dict(totals),
+         "manual": sessions(root, events), "automation": automation(root, events),
+         "pipeline": pipeline(root, events, consent), "consent": dict(consent), "since": a.since}
+    if a.html is not None:
+        import qa_metric_values, qa_metrics_html
+        m["catalog"] = qa_metric_values.catalog_values(root, events, m)
+        out = Path(a.html).resolve() if a.html else root / "05-metrics"
+        written, removed = qa_metrics_html.write_pages(out, m, qa_metric_values.load_catalog())
+        print(f"qa-metrics: {len(written)} pages in {out}" + (f", {len(removed)} stale page(s) removed" if removed else ""))
+        return 0
+    if a.json:
+        import qa_metric_values
+        m["catalog"] = qa_metric_values.catalog_values(root, events, m)
+    print(json.dumps(m, indent=2, ensure_ascii=False, default=str) if a.json else report(m))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
