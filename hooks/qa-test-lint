@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""qa-test-lint — checks a test file the moment an agent writes it, instead of at Gate 3.
+
+Hook for Claude Code (PostToolUse on Write|Edit|MultiEdit) and Cursor (postToolUse on
+Write, afterFileEdit). Only in a QA workspace (a .qa-project above the file), only for
+JS/TS files that are tests (*.spec.* / *.test.*) or live under a tests directory.
+
+Errors (the agent is told to fix them now):
+  L1 focused test             test.only / describe.only / it.only / fit / fdescribe
+  L2 fixed wait               waitForTimeout(...) or a setTimeout sleep
+  L3 status range             expect(status).toBeGreaterThanOrEqual(400), expect([200, 201]).toContain(...)
+  L4 assertion weakened       an edit replaced exact matchers (toBe, toEqual, toHaveText...) with
+                              weaker ones (toBeTruthy, toBeDefined, ranges, toContain, toMatch)
+  L6 commented-out test       // test(...)
+Warnings:
+  L5 per-spec retries         configure({ retries }) hides flakiness
+  L7 test.skip                prefer test.fixme('<reason>') so the test stays visible
+  L8 expected failure removed test.fail was taken out: only after the defect is verified fixed
+  L9 assertion removed        an edit reduced the number of expect() calls
+
+A line containing `qa-lint-allow: <reason>` is exempt; give the contract or decision as the reason.
+Usage: qa-test-lint --ide claude|cursor
+"""
+import argparse, json, os, re, sys
+from pathlib import Path
+
+CODE_EXT = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"}
+TEST_DIRS = {"03-tests", "tests", "test", "e2e", "__tests__", "specs"}
+ALLOW = "qa-lint-allow"
+EXACT = re.compile(r"\.(toBe|toEqual|toStrictEqual|toHaveText|toHaveValue|toHaveCount|toHaveURL|toHaveAttribute)\(")
+WEAK = re.compile(r"\.(toBeTruthy|toBeDefined|toBeGreaterThan|toBeGreaterThanOrEqual|toBeLessThan|"
+                  r"toBeLessThanOrEqual|toContain|toMatch|toContainText)\(|\.not\.")
+RULES = [
+    ("L1", "error", "focused test: remove .only before saving",
+     re.compile(r"\b(test|it|describe)(\.describe)?\.only\s*\(|\bf(it|describe)\s*\(")),
+    ("L2", "error", "fixed wait: use a web-first assertion or wait for the event, never a timeout",
+     re.compile(r"\.waitForTimeout\s*\(|new Promise\s*\(\s*\(?\s*\w+\s*\)?\s*=>\s*setTimeout\s*\(")),
+    ("L3", "error", "status range instead of the exact status: assert toBe(<code>) or cite the contract with qa-lint-allow",
+     re.compile(r"expect\((?:[^;()]|\(\))*status(?:[^;()]|\(\))*\)\s*\.\s*"
+                r"(toBeGreaterThanOrEqual|toBeGreaterThan|toBeLessThan|toBeLessThanOrEqual)\s*\(\s*\d{3}"
+                r"|expect\(\s*\[\s*\d{3}(\s*,\s*\d{3})+\s*\]\s*\)\s*\.\s*toContain\(")),
+    ("L6", "error", "commented-out test: delete it or mark it test.fixme with a reason",
+     re.compile(r"^\s*//\s*(test|it)(\.\w+)?\s*\(")),
+    ("L5", "warn", "per-spec retries hide flakiness: find the cause instead",
+     re.compile(r"\.configure\(\s*\{[^}]*\bretries\b")),
+    ("L7", "warn", "test.skip hides the test: prefer test.fixme('<reason>')",
+     re.compile(r"\btest\.skip\s*\(")),
+]
+
+
+def find_root(start):
+    d = Path(start).resolve()
+    for p in [d, *d.parents]:
+        if (p / ".qa-project").exists():
+            return p
+    return None
+
+
+def is_test_file(path):
+    p = Path(path)
+    if p.suffix not in CODE_EXT:
+        return False
+    return bool(re.search(r"\.(spec|test)\.", p.name)) or bool(TEST_DIRS & set(p.parts))
+
+
+def file_and_edits(payload):
+    ti = payload.get("tool_input") or {}
+    if isinstance(ti, str):
+        try:
+            ti = json.loads(ti)
+        except ValueError:
+            ti = {}
+    path = (payload.get("file_path") or ti.get("file_path") or ti.get("path") or ti.get("target_file")
+            or ti.get("filePath") or "")
+    edits = []
+    if "old_string" in ti:
+        edits.append((ti.get("old_string") or "", ti.get("new_string") or ""))
+    for e in (ti.get("edits") or payload.get("edits") or []):
+        if isinstance(e, dict):
+            edits.append((e.get("old_string") or "", e.get("new_string") or ""))
+    return path, edits
+
+
+def lint(text, edits):
+    findings = []
+    for n, line in enumerate(text.split("\n"), 1):
+        if ALLOW in line or len(line) > 2000:   # generated or minified lines are not hand-written tests
+            continue
+        for rid, level, why, rx in RULES:
+            if rx.search(line):
+                findings.append((level, f"{rid} line {n}: {why}: {line.strip()[:120]}"))
+    for old, new in edits:
+        keep = lambda s: "\n".join(l for l in s.split("\n") if ALLOW not in l)
+        o, w = keep(old), keep(new)
+        if len(EXACT.findall(o)) > len(EXACT.findall(w)) and len(WEAK.findall(w)) > len(WEAK.findall(o)):
+            findings.append(("error", "L4 assertion weakened: exact matchers were replaced by weaker ones. A test is "
+                                      "not fixed by relaxing it; cite the contract that allows the weaker form "
+                                      "(qa-lint-allow) or treat the failure as a product defect"))
+        if "test.fail(" in o and "test.fail(" not in w:
+            findings.append(("warn", "L8 test.fail removed: only when the defect is verified fixed; say which"))
+        if o.count("expect(") > w.count("expect("):
+            findings.append(("warn", "L9 an edit removed expect() calls: make sure no expected result lost its assertion"))
+    return findings
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ide", choices=["claude", "cursor"], required=True)
+    a = ap.parse_args()
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        payload = {}
+    path, edits = file_and_edits(payload)
+    out = {}
+    if path:
+        full = Path(path) if os.path.isabs(path) else Path(payload.get("cwd") or os.getcwd()) / path
+        if is_test_file(full) and find_root(full.parent) and full.exists():
+            findings = lint(full.read_text(encoding="utf-8", errors="replace"), edits)
+            errors = [f for lvl, f in findings if lvl == "error"]
+            warns = [f for lvl, f in findings if lvl == "warn"]
+            if findings:
+                msg = f"qa-test-lint {full.name}:\n- " + "\n- ".join(errors + warns)
+                if a.ide == "cursor":
+                    out = {"additional_context": msg}
+                elif errors:
+                    out = {"decision": "block", "reason": msg + "\nFix the errors now; they fail Gate 3 anyway."}
+                else:
+                    out = {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": msg}}
+    if out or a.ide == "cursor":
+        print(json.dumps(out))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:  # a broken lint must never block writing
+        print(f"qa-test-lint internal error: {type(e).__name__}: {e}", file=sys.stderr)
+        sys.exit(0)

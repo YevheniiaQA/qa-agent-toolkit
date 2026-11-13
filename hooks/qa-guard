@@ -1,0 +1,602 @@
+#!/usr/bin/env python3
+"""qa-guard — keeps an agent inside the external systems its QA project allows.
+
+Runs as a hook before every shell command, web fetch and MCP call, in Cursor and in
+Claude Code. Inside a QA workspace (a .qa-project file in the directory or above it)
+it finds every host a call would reach and allows only:
+
+  - local hosts, private networks, package registries, the IDEs' own services
+  - hosts of the systems listed in the project's INTEGRATIONS
+  - environment hosts named in the project profile (API_BASE_URL, UI_*_BASE_URL, DB_HOST, ...)
+  - read-only access to the sources the profile declares (GC_SOURCE_REPOS, GC_SOURCE_DOCS)
+  - hosts in NET_ALLOW (profile or ~/.qa-agent/.env), comma-separated, * wildcards
+
+A host that belongs to a known system missing from INTEGRATIONS is always denied.
+Any other host gets QA_GUARD_UNKNOWN: deny (default), ask, or allow.
+Outside a QA workspace it allows everything.
+
+It reads the command line, so it is a seatbelt, not a sandbox: a script file that
+calls a tracker by itself is not seen. Not giving a project the token is the real
+boundary; this stops the common path and says why.
+
+Usage:
+  qa-guard --ide claude|cursor                 hook mode: hook JSON on stdin
+  qa-guard --check URL|HOST [--cwd DIR] [--read]
+                                               prints "<decision>: <reason>"; exit 0 = allow
+Vocabulary: integrations.json beside this script. Log of denials: ~/.qa-agent/logs/qa-guard.jsonl
+"""
+import argparse, datetime, fnmatch, ipaddress, json, os, re, shlex, subprocess, sys
+from urllib.parse import urlsplit
+
+QA_HOME = os.path.expanduser(os.environ.get("QA_AGENT_HOME", "~/.qa-agent"))
+HERE = os.path.dirname(os.path.realpath(__file__))
+ORDER = {"allow": 0, "ask": 1, "deny": 2}
+
+URL_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]{1,15})://([^\s'\"<>`|;&,)\]\\]+)")
+SCP_RE = re.compile(r"(?i)(?<![\w/:])[\w.\-]+@([a-z0-9][a-z0-9\-]*(?:\.[a-z0-9\-]+)+):(?!//)")
+HOST_RE = re.compile(r"(?i)^(?:[\w.\-]+@)?([a-z0-9][a-z0-9\-]*(?:\.[a-z0-9\-]+)+)(?::\d+)?([/:]\S*)?$")
+VAR_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
+NOT_TLD = {"json", "md", "txt", "yaml", "yml", "ts", "js", "mjs", "py", "sh", "html", "csv", "xml",
+           "log", "png", "jpg", "zip", "gz", "tgz", "env", "lock", "toml", "ini", "cfg", "conf", "sql"}
+SKIP_SCHEMES = {"file", "data", "mailto", "about", "blob", "chrome", "vscode", "cursor"}
+
+NET_CMDS = {"curl", "wget", "http", "https", "xh", "ssh", "scp", "sftp", "rsync", "nc", "ncat", "telnet"}
+INTERPRETERS = {"python", "python3", "node", "deno", "bun", "ruby", "perl", "php", "bash", "sh", "zsh"}
+NET_CAPABLE = NET_CMDS | INTERPRETERS | {"git", "npx", "psql", "mysql", "mongosh", "redis-cli", "k6",
+                                         "newman", "pact-broker", "docker"}
+WRAPPERS = {"sudo", "env", "time", "nohup", "timeout", "watch", "xargs", "exec", "command", "eval",
+            # shell keywords: `do git push`, `then curl ...` run the command after them
+            "do", "then", "else", "elif", "if", "while", "until", "!", "{", "(", "done", "fi"}
+LOOP_RE = re.compile(r"(?m)(^|[;&|\s])(for|while|until)\s")
+CURL_FILE_OPTS = {"-o", "--output", "-T", "--upload-file", "-K", "--config", "--cacert", "--cert",
+                  "--key", "-b", "--cookie", "-c", "--cookie-jar", "-D", "--dump-header",
+                  "-H", "--header", "-u", "--user", "-A", "--user-agent", "-e", "--referer",
+                  "-d", "--data", "--data-raw", "--data-binary", "--data-urlencode", "-F", "--form",
+                  "--json", "-X", "--request", "-w", "--write-out", "-O", "--output-dir"}
+CURL_WRITE_OPTS = {"-d", "--data", "--data-raw", "--data-binary", "--data-urlencode", "-F", "--form",
+                   "-T", "--upload-file", "--json", "--post-data", "--post-file", "--body-data", "--body-file"}
+GIT_READ = {"clone", "fetch", "pull", "ls-remote", "submodule"}
+GIT_NET = GIT_READ | {"push"}
+URL_KEYS = re.compile(r"(?i)^(url|uri|href|link|endpoint|base_?url|server_?url|host|domain|site)$")
+
+
+# ---------- configuration ----------
+
+def read_env(path):
+    """Literal KEY=VALUE parse, the same rules as qa-env.sh: never evaluated, ' # comment' dropped."""
+    out = {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line)
+        if not m:
+            continue
+        key, val = m.groups()
+        val = "" if val.lstrip().startswith("#") else re.sub(r"\s+#.*$", "", val)
+        out[key] = val.strip()
+    return out
+
+
+def find_project(start):
+    d = os.path.abspath(start or os.getcwd())
+    while True:
+        marker = os.path.join(d, ".qa-project")
+        if os.path.isfile(marker):
+            try:
+                name = open(marker, encoding="utf-8").read().strip()
+            except OSError:
+                name = ""
+            return name, d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None, None
+        d = parent
+
+
+class Policy:
+    def __init__(self, project, root):
+        self.project, self.root = project, root
+        with open(os.path.join(HERE, "integrations.json"), encoding="utf-8") as fh:
+            vocab = json.load(fh)
+        self.always = vocab["always"]
+        self.systems = vocab["systems"]
+        self.read_only_vars = set(vocab.get("readOnlySources", []))
+        defaults = read_env(os.path.join(QA_HOME, ".env"))
+        prof_path = os.path.join(QA_HOME, "projects", project or "_none_", "profile.env")
+        self.profile_ok = bool(project) and os.path.isfile(prof_path)
+        self.prof_path = prof_path
+        prof = read_env(prof_path) if self.profile_ok else {}
+        self.cfg = dict(defaults, **prof)
+        self.enabled = {s.strip().lower() for s in self.cfg.get("INTEGRATIONS", "").split(",") if s.strip()}
+        self.unknown = self.cfg.get("QA_GUARD_UNKNOWN", "deny").strip().lower()
+        if self.unknown not in ORDER:
+            self.unknown = "deny"
+        allow = defaults.get("NET_ALLOW", "") + "," + prof.get("NET_ALLOW", "")
+        self.net_allow = [h.strip().lower() for h in allow.split(",") if h.strip()]
+        self.var_hosts = {}      # host -> system, for self-hosted systems named in the profile
+        self.env_hosts = set()   # environment hosts named in the profile
+        self.sources = []        # (host, path prefix) of read-only sources
+        for key, val in self.cfg.items():
+            if key in ("NET_ALLOW", "INTEGRATIONS", "QA_GUARD_UNKNOWN"):
+                continue
+            hosts = hosts_in_value(val, key)
+            if not hosts:
+                continue
+            system = self.system_of_var(key)
+            for h, p in hosts:
+                if key in self.read_only_vars:
+                    self.sources.append((h, norm_path(p)))
+                elif system:
+                    if not self.static_systems(h, p):
+                        self.var_hosts[h] = system
+                else:
+                    self.env_hosts.add(h)
+
+    def system_of_var(self, name):
+        for sys_name, spec in self.systems.items():
+            if any(fnmatch.fnmatchcase(name, pat) for pat in spec.get("vars", [])):
+                return sys_name
+        return None
+
+    def static_systems(self, host, path):
+        found = []
+        for sys_name, spec in self.systems.items():
+            if not any(host_match(host, pat) for pat in spec.get("hosts", [])):
+                continue
+            paths, not_paths = spec.get("paths"), spec.get("notPaths", [])
+            if paths and not any(path.startswith(p) for p in paths):
+                continue
+            if any(path.startswith(p) for p in not_paths):
+                continue
+            found.append(sys_name)
+        return found
+
+    def is_source(self, host, path):
+        p = norm_path(path)
+        return any(host == h and (not sp or p == sp or p.startswith(sp + "/")) for h, sp in self.sources)
+
+    def judge(self, t):
+        """t: dict(host, path, read, via, systems). Returns (decision, reason)."""
+        host, path = t.get("host", ""), t.get("path", "")
+        systems = set(t.get("systems") or [])
+        if host:
+            if is_local(host) or any(host_match(host, p) for p in self.always):
+                return "allow", f"{host}: local or always allowed"
+            systems |= set(self.static_systems(host, path))
+            if host in self.var_hosts:
+                systems.add(self.var_hosts[host])
+        if systems:
+            off = sorted(s for s in systems if s not in self.enabled)
+            if off and host and t.get("read") and self.is_source(host, path):
+                return "allow", f"{host}{path}: declared source, read-only"
+            if off:
+                what = host or t.get("via", "call")
+                return "deny", (f"{what} belongs to {', '.join(off)}, which is not in INTEGRATIONS "
+                                f"for project '{self.project}'")
+            return "allow", f"{host or t.get('via')}: {', '.join(sorted(systems))} enabled"
+        if not host:
+            return "allow", "no external host"
+        if not self.profile_ok:
+            return "deny", (f"{host}: no profile at {self.prof_path}, so no host outside localhost "
+                            f"is known to be allowed")
+        if host in self.env_hosts:
+            return "allow", f"{host}: environment in the project profile"
+        if t.get("read") and self.is_source(host, path):
+            return "allow", f"{host}{path}: declared source, read-only"
+        if any(host_match(host, p) for p in self.net_allow):
+            return "allow", f"{host}: NET_ALLOW"
+        return self.unknown, (f"{host} is not an environment, source or integration of project "
+                              f"'{self.project}' (add it to NET_ALLOW if it should be reachable)")
+
+
+def norm_path(path):
+    return path.rstrip("/").removesuffix(".git")
+
+
+def host_match(host, pattern):
+    host, pattern = host.lower(), pattern.lower()
+    if pattern.startswith("*."):
+        return host == pattern[2:] or host.endswith(pattern[1:])
+    return host == pattern
+
+
+def is_local(host):
+    h = host.strip("[]").lower()
+    if "." not in h and ":" not in h:
+        return True          # single-label names: docker services, machine-local hosts
+    try:
+        ip = ipaddress.ip_address(h)
+        return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified
+    except ValueError:
+        return False
+
+
+def split_url(raw):
+    """Returns (host, path) for a URL, or None."""
+    try:
+        u = urlsplit(raw if "://" in raw else "//" + raw)
+        host = (u.hostname or "").lower()
+    except ValueError:
+        return None
+    return (host, u.path or "") if host else None
+
+
+def hosts_in_value(val, key=""):
+    out = []
+    for m in URL_RE.finditer(val or ""):
+        if m.group(1).lower() in SKIP_SCHEMES:
+            continue
+        hp = split_url(m.group(0))
+        if hp:
+            out.append(hp)
+    for m in SCP_RE.finditer(val or ""):
+        rest = val[m.end():].split()
+        out.append((m.group(1).lower(), "/" + rest[0] if rest else ""))
+    if not out and key.endswith("_HOST") and val and " " not in val:
+        out.append((val.lower(), ""))
+    return out
+
+
+# ---------- target extraction ----------
+
+def bare_host(tok):
+    m = HOST_RE.match(tok)
+    if not m:
+        return None
+    host, rest = m.group(1).lower(), m.group(2) or ""
+    tld = host.rsplit(".", 1)[-1]
+    if not tld.isalpha() or tld in NOT_TLD:
+        return None
+    path = "/" + rest[1:].lstrip("/") if rest.startswith(":") else rest   # scp-style host:path
+    return host, path
+
+
+def segments(command):
+    """Split on newlines, ;, &&, || and | outside quotes, so `python3 -c "a; b"` stays one segment."""
+    text, out, cur, quote, i = command.replace("\\\n", " "), [], [], "", 0
+    while i < len(text):
+        c = text[i]
+        if quote:
+            if c == "\\" and quote == '"' and i + 1 < len(text):
+                cur.append(text[i:i + 2]); i += 2; continue
+            if c == quote:
+                quote = ""
+            cur.append(c)
+        elif c in "'\"":
+            quote = c; cur.append(c)
+        elif c == "\\" and i + 1 < len(text):
+            cur.append(text[i:i + 2]); i += 2; continue
+        elif c in "\n;|" or text.startswith("&&", i):
+            out.append("".join(cur)); cur = []
+            if text.startswith(("&&", "||"), i):
+                i += 1
+        else:
+            cur.append(c)
+        i += 1
+    out.append("".join(cur))
+    return [s.strip() for s in out if s.strip()]
+
+
+HEREDOC_RE = re.compile(r"(?<!<)<<(?!<)-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+SHELLS = {"bash", "sh", "zsh"}
+
+
+def split_heredocs(command):
+    """(command without heredoc bodies, [(line that opens the heredoc, body)]).
+    A `<<WORD` with no terminating WORD line is not a heredoc (e.g. a shift inside quotes)."""
+    lines, out, bodies, i = command.split("\n"), [], [], 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        i += 1
+        for m in HEREDOC_RE.finditer(line):
+            end = next((j for j in range(i, len(lines)) if lines[j].strip() == m.group(2)), None)
+            if end is None:
+                continue
+            bodies.append((line, "\n".join(lines[i:end])))
+            i = end + 1
+    return "\n".join(out), bodies
+
+
+def words(seg):
+    try:
+        return shlex.split(seg, comments=False)
+    except ValueError:
+        return seg.split()
+
+
+def main_word(ws):
+    i = 0
+    while i < len(ws) and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", ws[i]) or os.path.basename(ws[i]) in WRAPPERS
+                           or ws[i].startswith("-") and i > 0 and os.path.basename(ws[i - 1]) in WRAPPERS):
+        i += 1
+    return (os.path.basename(ws[i]) if i < len(ws) else ""), i
+
+
+def is_write(cmd, ws):
+    if cmd in ("curl", "wget"):
+        for j, w in enumerate(ws):
+            if w in CURL_WRITE_OPTS or any(w.startswith(o + "=") for o in CURL_WRITE_OPTS if o.startswith("--")):
+                return True
+            if w in ("-X", "--request", "--method") and j + 1 < len(ws) and ws[j + 1].upper() not in ("GET", "HEAD"):
+                return True
+            if re.match(r"^-X(?!GET$|HEAD$)\w+$", w):
+                return True
+        return False
+    return cmd not in ("http", "https", "xh") or any(w.upper() in ("POST", "PUT", "PATCH", "DELETE") for w in ws)
+
+
+def git_targets(ws, start, cwd):
+    """Targets of a git network subcommand that names a remote instead of a URL."""
+    i, gdir = start + 1, cwd
+    while i < len(ws) and ws[i].startswith("-"):
+        if ws[i] in ("-C",) and i + 1 < len(ws):
+            gdir = os.path.join(cwd, ws[i + 1]); i += 2; continue
+        if ws[i] == "-c":
+            i += 2; continue
+        i += 1
+    if i >= len(ws) or ws[i] not in GIT_NET:
+        return None, []
+    sub, args = ws[i], [a for a in ws[i + 1:] if not a.startswith("-")]
+    read = sub in GIT_READ
+    if any("://" in a or SCP_RE.search(a + ":") for a in args) or sub == "clone":
+        return read, []          # explicit URL: the URL scan covers it
+    remote = args[0] if args else "origin"
+    out = []
+    for name in dict.fromkeys([remote, "origin"]):
+        try:
+            r = subprocess.run(["git", "-C", gdir, "remote", "get-url", "--all", name],
+                               capture_output=True, text=True, timeout=3)
+        except (OSError, subprocess.SubprocessError):
+            break
+        if r.returncode == 0:
+            for line in r.stdout.split():
+                out += [dict(host=h, path=p, read=read, via=f"git {sub} {name}") for h, p in hosts_in_value(line)]
+            break
+    return read, out
+
+
+def segment_is_read(seg, system_cmds, cwd):
+    ws = words(seg)
+    cmd, i = main_word(ws)
+    if cmd in INTERPRETERS or cmd in system_cmds:
+        return False
+    if cmd == "git":
+        gread, _ = git_targets(ws, i, cwd)
+        return gread is not False
+    return not is_write(cmd, ws)
+
+
+def loop_spans(segs):
+    """The segments of each outermost for / while / until … done loop."""
+    spans, cur, depth = [], [], 0
+    for s in segs:
+        first = s.split(None, 1)[0] if s.split() else ""
+        if first in ("for", "while", "until"):
+            depth += 1
+        if depth:
+            cur.append(s)
+        if first == "done" and depth:
+            depth -= 1
+            if not depth:
+                spans.append(cur)
+                cur = []
+    return spans + ([cur] if cur else [])
+
+
+def shell_targets(policy, command, cwd):
+    targets = []
+    system_cmds = {c for spec in policy.systems.values() for c in spec.get("commands", [])}
+    command, bodies = split_heredocs(command)
+    segs = segments(command)
+    # A heredoc body is a script only when its line feeds a program that can reach the network
+    # (`python3 - <<EOF`, `cat <<EOF | node`); fed to cat or tee it is file content, not traffic.
+    for line, body in bodies:
+        feeds = [main_word(words(s))[0] for s in segments(line)]
+        if any(f in SHELLS for f in feeds):
+            targets += shell_targets(policy, body, cwd)
+        elif any(f in NET_CAPABLE | system_cmds for f in feeds):
+            targets += [dict(host=h, path=p, read=False, via="script") for h, p in hosts_in_value(body)]
+    # A loop variable carries its value into the body (`for h in x.atlassian.net; do curl https://$h`):
+    # when a loop runs a network command, every URL and bare host in that loop counts. The hosts
+    # count as read only when every network command in the loop is a read (`git ls-remote $r`
+    # over the declared source repos).
+    for span in loop_spans(segs):
+        net_segs = [s for s in span if main_word(words(s))[0] in NET_CAPABLE | system_cmds]
+        if not net_segs:
+            continue
+        loop_read = all(segment_is_read(s, system_cmds, cwd) for s in net_segs)
+        targets += [dict(host=h, path=p, read=loop_read, via="loop") for h, p in hosts_in_value(" ".join(span))]
+        targets += [dict(host=hp[0], path=hp[1], read=loop_read, via="loop")
+                    for s in span for w in words(s) if (hp := bare_host(w.strip("'\"")))]
+    for seg in segs:
+        ws = words(seg)
+        cmd, i = main_word(ws)
+        if not cmd:
+            continue
+        for sys_name, spec in policy.systems.items():
+            if cmd in spec.get("commands", []):
+                targets.append(dict(systems=[sys_name], via=f"`{cmd}` CLI"))
+        if cmd not in NET_CAPABLE and cmd not in system_cmds:
+            continue
+        read = not is_write(cmd, ws)
+        if cmd == "git":
+            gread, gt = git_targets(ws, i, cwd)
+            read = gread if gread is not None else read
+            targets += gt
+        targets += [dict(host=h, path=p, read=read, via=cmd) for h, p in hosts_in_value(seg)]
+        if cmd in NET_CMDS:
+            prev = ""
+            for w in ws[i + 1:]:
+                if not w.startswith("-") and prev not in CURL_FILE_OPTS and "://" not in w:
+                    hp = bare_host(w)
+                    if hp:
+                        targets.append(dict(host=hp[0], path=hp[1], read=read, via=cmd))
+                prev = w
+        for name in VAR_RE.findall(seg):
+            system = policy.system_of_var(name)
+            if system:
+                targets.append(dict(systems=[system], via=f"${name}"))
+            elif name in policy.cfg:
+                targets += [dict(host=h, path=p, read=read, via=f"${name}") for h, p in hosts_in_value(policy.cfg[name])]
+    return targets
+
+
+def walk_urls(obj, out, key=""):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            walk_urls(v, out, k)
+    elif isinstance(obj, list):
+        for v in obj:
+            walk_urls(v, out, key)
+    elif isinstance(obj, str) and URL_KEYS.match(key or ""):
+        out += hosts_in_value(obj) or ([(obj.lower(), "")] if bare_host(obj) else [])
+
+
+def mcp_targets(policy, ident_text, tool_input, server_url=""):
+    text = ident_text.lower()
+    specific = [s for s, spec in policy.systems.items() if any(k in text for k in spec.get("mcp", []))]
+    generic = [s for s, spec in policy.systems.items() if any(k in text for k in spec.get("mcpGeneric", []))]
+    targets = [dict(systems=[s], via="MCP " + ident_text[:60]) for s in (specific or generic)]
+    found = []
+    if isinstance(tool_input, str):
+        try:
+            tool_input = json.loads(tool_input)
+        except ValueError:
+            tool_input = {}
+    walk_urls(tool_input, found)
+    for h, p in hosts_in_value(server_url):
+        found.append((h, p))
+    targets += [dict(host=h, path=p, read=False, via="MCP") for h, p in found]
+    return targets
+
+
+# ---------- hook glue ----------
+
+def decide(policy, targets):
+    worst, reasons, hosts, systems = "allow", [], [], set()
+    for t in targets:
+        d, why = policy.judge(t)
+        if ORDER[d] > ORDER[worst]:
+            worst, reasons = d, []
+        if d == worst and d != "allow" and why not in reasons:
+            reasons.append(why)
+        if d != "allow":
+            hosts.append(t.get("host") or t.get("via"))
+            systems |= set(t.get("systems") or [])
+    return worst, reasons[:3], hosts, sorted(systems)
+
+
+def log(entry):
+    try:
+        os.makedirs(os.path.join(QA_HOME, "logs"), exist_ok=True)
+        with open(os.path.join(QA_HOME, "logs", "qa-guard.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def trace(ide, payload):
+    """With ~/.qa-agent/logs/hooks.trace present, record which fields the IDE sends (never values
+    of commands or inputs), to diagnose an IDE that does not pass the working directory."""
+    if not os.path.exists(os.path.join(QA_HOME, "logs", "hooks.trace")):
+        return
+    log({"ts": datetime.datetime.now().isoformat(timespec="seconds"), "trace": True, "ide": ide,
+         "event": payload.get("hook_event_name") or payload.get("tool_name"), "keys": sorted(payload),
+         "cwd": payload.get("cwd"), "workspace_roots": payload.get("workspace_roots"),
+         "process_cwd": os.getcwd()})
+
+
+def hook(ide, payload):
+    trace(ide, payload)
+    cwd = payload.get("cwd") or (payload.get("workspace_roots") or [None])[0] or os.getcwd()
+    project, root = find_project(cwd)
+    if project is None:
+        return "allow", ""
+    policy = Policy(project, root)
+    if ide == "claude":
+        tool, ti = payload.get("tool_name", ""), payload.get("tool_input") or {}
+        if tool == "Bash":
+            targets = shell_targets(policy, ti.get("command", ""), cwd)
+        elif tool == "WebFetch":
+            hp = split_url(ti.get("url", ""))
+            targets = [dict(host=hp[0], path=hp[1], read=True, via="WebFetch")] if hp else []
+        elif tool.startswith("mcp__"):
+            targets = mcp_targets(policy, tool, ti)
+        else:
+            targets = []
+    else:
+        event = payload.get("hook_event_name", "")
+        if "MCP" not in event and "tool_name" not in payload:
+            targets = shell_targets(policy, payload.get("command", ""), cwd)
+        else:
+            ident = " ".join(str(payload.get(k, "")) for k in ("tool_name", "server_name", "server", "command"))
+            targets = mcp_targets(policy, ident, payload.get("tool_input") or {}, str(payload.get("url", "")))
+    decision, reasons, hosts, systems = decide(policy, targets)
+    if decision == "allow":
+        return "allow", ""
+    log({"ts": datetime.datetime.now().isoformat(timespec="seconds"), "ide": ide, "project": project,
+         "decision": decision, "hosts": hosts[:5], "systems": systems})
+    msg = ("qa-guard: " + "; ".join(reasons) + ". Profile: " + policy.prof_path +
+           ". Do not route around this: write a local file instead (for a defect, bugs/<id>.md in the "
+           "workspace) or ask the engineer to change INTEGRATIONS or NET_ALLOW.")
+    return decision, msg
+
+
+def emit(ide, decision, msg):
+    if ide == "claude":
+        if decision != "allow":
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                                     "permissionDecision": decision,
+                                                     "permissionDecisionReason": msg}}))
+    else:
+        out = {"permission": decision}
+        if msg:
+            out.update(user_message=msg, agent_message=msg)
+        print(json.dumps(out))
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True, description="Integration boundary hook for QA workspaces")
+    ap.add_argument("--ide", choices=["claude", "cursor"])
+    ap.add_argument("--check", metavar="URL_OR_HOST")
+    ap.add_argument("--cwd", default=os.getcwd())
+    ap.add_argument("--read", action="store_true", help="--check: treat the access as read-only")
+    a = ap.parse_args()
+
+    if a.check:
+        project, root = find_project(a.cwd)
+        if project is None:
+            print("allow: not a QA workspace (no .qa-project)")
+            return 0
+        hp = split_url(a.check)
+        if not hp:
+            print("deny: cannot parse " + a.check)
+            return 1
+        d, why = Policy(project, root).judge(dict(host=hp[0], path=hp[1], read=a.read, via="check"))
+        print(f"{d}: {why}")
+        return 0 if d == "allow" else 1
+
+    if not a.ide:
+        ap.error("--ide or --check is required")
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        emit(a.ide, "allow", "")
+        return 0
+    try:
+        decision, msg = hook(a.ide, payload)
+    except Exception as e:   # never brick the IDE; in a QA workspace, hand the decision to the human
+        cwd = payload.get("cwd") or (payload.get("workspace_roots") or [None])[0]
+        in_ws = find_project(cwd)[0] is not None if cwd else False
+        decision, msg = ("ask", f"qa-guard internal error ({type(e).__name__}: {e}); review this call") if in_ws \
+            else ("allow", "")
+    emit(a.ide, decision, msg)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

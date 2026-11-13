@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+"""qa-stage-gate — a QA stage cannot report done until its gate file is complete.
+
+Hook for Claude Code (SubagentStop, Stop) and Cursor (subagentStop, stop). Inside a QA
+workspace (a .qa-project above the working directory):
+
+  Claude SubagentStop  a qa-* stage agent (by agent type, or a final message that starts
+                       with "STAGE") must leave a gate file that `qa-gate check-stage`
+                       accepts. Otherwise exit 2: the agent is sent back to work with the
+                       reasons. An honest failed / partial / blocked gate file is accepted;
+                       a missing or incomplete one is not.
+  Claude Stop          the main conversation may not end while a stage marked passed in a
+                       _pipeline.json, or a gate file written in the last 120 minutes, fails
+                       `qa-gate check-pipeline`. Sent back once (stop_hook_active).
+  Cursor stop / subagentStop
+                       the same check-pipeline, answered with a followup_message.
+
+An agent is sent back at most 3 times; after that the stop goes through, is logged, and the
+orchestrator's own check-stage is the next line of defence.
+
+Every decision is also a `stage` event in 05-metrics/events.jsonl (qa_events): attempt, gate
+decision, the gate file's status and artefact hashes, and for a Claude subagent the tokens,
+cost and duration of its transcript (cumulative per runId). On stop, a gate file that changed
+since its last event (a stage run in the main conversation, or a Cursor subagent) is recorded too.
+Usage: qa-stage-gate --ide claude|cursor --event subagent-stop|stop
+"""
+import argparse, datetime, hashlib, json, os, re, subprocess, sys, time
+from pathlib import Path
+
+QA_HOME = Path(os.path.expanduser(os.environ.get("QA_AGENT_HOME", "~/.qa-agent")))
+QA_GATE = Path(os.path.realpath(__file__)).parent.parent / "bin" / "qa-gate"
+sys.path.insert(0, str(QA_GATE.parent))
+import qa_events  # noqa: E402
+MAX_SENDBACKS = 3
+RECENT_MIN = 120
+PROJECT_SCOPED = {"qa-context", "qa-preflight", "qa-housekeeping"}
+AGENT_STAGES = {
+    "qa-automation-api": ["automation-api"], "qa-automation-ui": ["automation-ui"],
+    "qa-context": ["global-context-builder"], "qa-debugger": ["test-debugger"],
+    "qa-preflight": ["access-preflight"], "qa-requirements": ["requirements-decomposer"],
+    "qa-scenarios": ["scenarios-generator"], "qa-selectors": ["selectors-collector"],
+    "qa-sync": ["automation-compare", "scenario-data-fix"],
+    "qa-manual": ["manual-test-cases", "test-execution"], "qa-report": ["test-report", "qa-metrics"],
+    "qa-critic": [],   # the stage comes from its STAGE / Gate file lines
+    "qa-special": [],  # contract-, performance- or security-testing: from its STAGE line
+}
+GATE_LINE = re.compile(r"(?m)^\s*Gate files?:\s*(\S+)")
+STAGE_LINE = re.compile(r"(?m)^\s*STAGE\s+(\S+).*?\bticket\s+(\S+)")
+
+
+def find_root(start):
+    d = Path(start or os.getcwd()).resolve()
+    for p in [d, *d.parents]:
+        if (p / ".qa-project").exists():
+            return p
+    return None
+
+
+def log(entry):
+    try:
+        (QA_HOME / "logs").mkdir(parents=True, exist_ok=True)
+        with open(QA_HOME / "logs" / "qa-stage-gate.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(dict(ts=datetime.datetime.now().isoformat(timespec="seconds"), **entry),
+                                ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def trace(ide, event, payload):
+    if (QA_HOME / "logs" / "hooks.trace").exists():
+        log({"trace": True, "ide": ide, "event": event, "keys": sorted(payload),
+             "agent_type": payload.get("agent_type") or payload.get("subagent_type")})
+
+
+def last_message(payload):
+    for key in ("last_assistant_message", "last_message", "summary"):
+        if isinstance(payload.get(key), str) and payload[key].strip():
+            return payload[key]
+    path = payload.get("agent_transcript_path") or payload.get("transcript_path")
+    if not path or not os.path.exists(path):
+        return ""
+    text = ""
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            msg = rec.get("message") if isinstance(rec.get("message"), dict) else rec
+            if rec.get("type") != "assistant" and msg.get("role") != "assistant":
+                continue
+            content = msg.get("content")
+            parts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"] \
+                if isinstance(content, list) else [content] if isinstance(content, str) else []
+            # a subagent may hand its final report back through a tool (SubagentHandback) instead of text
+            parts += [str(c.get("input", {}).get("message", "")) for c in content or []
+                      if isinstance(c, dict) and c.get("type") == "tool_use" and "handback" in str(c.get("name", "")).lower()] \
+                if isinstance(content, list) else []
+            if any(p.strip() for p in parts):
+                text = "\n".join(parts)
+    return text
+
+
+def expand(path):
+    m = re.search(r"\{([^}]+)\}", path)
+    if not m:
+        return [path]
+    return [path[:m.start()] + alt + path[m.end():] for alt in m.group(1).split(",")]
+
+
+def gate_targets(agent_type, msg):
+    """[(ticket, stage)] this agent must have written, or None when it cannot be told."""
+    out = []
+    for raw in GATE_LINE.findall(msg):
+        for p in expand(raw.strip("`")):
+            m = re.search(r"02-analysis/([^/]+)/_gates/([^/]+)\.json", p)
+            if m and "<" not in p:
+                out.append((m.group(1), m.group(2)))
+    if out:
+        return out
+    m = STAGE_LINE.search(msg)
+    ticket = "_project" if agent_type in PROJECT_SCOPED else (m.group(2) if m else None)
+    stages = AGENT_STAGES.get(agent_type) or ([m.group(1)] if m else [])
+    if not ticket or "<" in ticket or not stages:
+        return None
+    return [(ticket, s) for s in stages]
+
+
+def run_gate(root, *args):
+    r = subprocess.run([sys.executable, str(QA_GATE), *args, "--root", str(root), "--json"],
+                       capture_output=True, text=True, timeout=300)
+    try:
+        doc = json.loads(r.stdout)
+    except ValueError:
+        return [f"qa-gate {' '.join(args)} did not run: {r.stderr.strip()[-200:]}"]
+    return [f"{c['id']} {c['check']}" + (f" — {c['detail']}" if c.get("detail") else "")
+            for c in doc.get("checks", []) if c.get("result") == "fail"]
+
+
+def sendback_count(key, add=1):
+    state_file = QA_HOME / "logs" / "qa-stage-gate.state.json"
+    try:
+        state = json.loads(state_file.read_text())
+    except (OSError, ValueError):
+        state = {}
+    if not add:
+        return state.get(key, 0)
+    state[key] = state.get(key, 0) + add
+    state = dict(list(state.items())[-200:])
+    try:
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(json.dumps(state))
+    except OSError:
+        pass
+    return state[key]
+
+
+def gate_doc(root, ticket, stage):
+    gf = root / "02-analysis" / ticket / "_gates" / f"{stage}.json"
+    try:
+        return gf, json.loads(gf.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return gf, None
+
+
+def stage_event(root, gf, doc, **extra):
+    """A `stage` event for one gate file: its status and the hashes of it and its artefacts."""
+    rel = str(gf.relative_to(root))
+    arts = [rel] + [a for a in (doc or {}).get("artefacts") or [] if isinstance(a, str)]
+    ticket = (doc or {}).get("ticket") or gf.parent.parent.name
+    ev = dict(kind="stage", ticket=None if ticket == "_project" else ticket, stage=gf.stem,
+              agent=(doc or {}).get("agent"),
+              status=(doc or {}).get("status") or ("passed" if (doc or {}).get("verdict") else "running"),
+              artefacts=qa_events.hashes(root, arts) or None, source=rel)
+    ev.update(extra)
+    try:
+        qa_events.append(root, ev)
+    except (OSError, ValueError) as e:
+        log({"event": "metric-event-error", "error": str(e)[:200]})
+
+
+def record_subagent(root, payload, agent_type, targets, decision, attempt, failures):
+    usage = qa_events.transcript_usage(payload.get("agent_transcript_path")) or {}
+    extra = dict(ide="claude", runId=payload.get("agent_id"), attempt=attempt, decision=decision,
+                 failures=[f.split(" ")[0] if re.match(r"[A-Z]\d+ ", f) else "no-gate-file-line" for f in failures][:10] or None,
+                 tokens=usage.get("tokens"), costUsd=usage.get("costUsd"), durationS=usage.get("durationS"),
+                 model=usage.get("model"))
+    if not targets:
+        try:
+            qa_events.append(root, dict(kind="stage", stage=agent_type, agent=agent_type, status="running",
+                                        note="gate file not identified from the final report", **extra))
+        except (OSError, ValueError) as e:
+            log({"event": "metric-event-error", "error": str(e)[:200]})
+        return
+    for t, s in targets:
+        gf, doc = gate_doc(root, t, s)
+        stage_event(root, gf, doc, **{**extra, "agent": agent_type})
+
+
+def record_changed_gates(root, ide):
+    """Stages whose gate file changed since its last event: run here, or by an agent with no transcript."""
+    events, _ = qa_events.read(root)
+    seen = {}
+    for ev in events:
+        if ev.get("kind") == "stage" and ev.get("source"):
+            seen[ev["source"]] = (ev.get("artefacts") or {}).get(ev["source"])
+    for gf in sorted((root / "02-analysis").glob("*/_gates/*.json")):
+        rel = str(gf.relative_to(root))
+        if gf.name.endswith(".critic.json") or seen.get(rel) == qa_events.sha256(gf):
+            continue
+        _, doc = gate_doc(root, gf.parent.parent.name, gf.stem)
+        if doc is not None:
+            stage_event(root, gf, doc, ide=ide)
+
+
+def agent_started(payload):
+    """When the subagent's transcript begins, as epoch seconds; None if unknown."""
+    path = payload.get("agent_transcript_path")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                ts = json.loads(line).get("timestamp")
+                if ts:
+                    return datetime.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except (OSError, TypeError, ValueError):
+        pass
+    return None
+
+
+def written_by(root, agent_type, since):
+    """Gate files this agent wrote during its run: its `agent` field, or a critic file for qa-critic."""
+    out = []
+    for gf in sorted((root / "02-analysis").glob("*/_gates/*.json")):
+        if since is None or gf.stat().st_mtime < since:
+            continue
+        stage = gf.name[:-len(".json")]
+        try:
+            doc = json.loads(gf.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if (agent_type == "qa-critic" and stage.endswith(".critic")) or doc.get("agent") == agent_type:
+            out.append((gf.parent.parent.name, stage))
+    return out or None
+
+
+def subagent_stop_claude(payload, root):
+    agent_type = payload.get("agent_type") or payload.get("subagent_type") or ""
+    msg = last_message(payload)
+    if agent_type.startswith("qa-") and not GATE_LINE.search(msg):
+        time.sleep(1)                 # the handback record can land in the transcript just after the stop
+        msg = last_message(payload) or msg
+    if not agent_type.startswith("qa-") and not STAGE_LINE.search(msg):
+        return 0, ""
+    targets = gate_targets(agent_type, msg)
+    if targets is None and agent_type.startswith("qa-"):
+        targets = written_by(root, agent_type, agent_started(payload))
+    if targets is None:
+        failures = ["the final message has no 'Gate file:' line and no 'STAGE <stage> … ticket <TICKET>' line, "
+                    "so the gate file cannot be found"]
+    else:
+        failures = [f"{t}/{s}: {f}" for t, s in targets for f in run_gate(root, "check-stage", t, s)]
+    key = payload.get("agent_id") or payload.get("agent_transcript_path") or hashlib.sha1(msg.encode()).hexdigest()
+    if not failures:
+        log({"ide": "claude", "event": "SubagentStop", "agent": agent_type, "decision": "allow", "targets": targets})
+        record_subagent(root, payload, agent_type, targets, "allow", sendback_count(f"claude:{key}", 0) + 1, [])
+        return 0, ""
+    n = sendback_count(f"claude:{key}")
+    log({"ide": "claude", "event": "SubagentStop", "agent": agent_type, "decision": "block" if n <= MAX_SENDBACKS
+         else "gave-up", "attempt": n, "failures": failures[:10]})
+    record_subagent(root, payload, agent_type, targets, "block" if n <= MAX_SENDBACKS else "gave-up", n,
+                    [f.split(": ", 1)[-1] for f in failures])
+    if n > MAX_SENDBACKS:
+        return 0, ""
+    return 2, ("qa-stage-gate: this stage is not done.\n- " + "\n- ".join(failures[:12]) +
+               "\nFix the gate file (or the work it reports), run `qa-gate check-stage <TICKET> <STAGE>` until it "
+               "passes, then send the final report again in the agent's format. If the stage cannot be finished, "
+               "say so in the gate file: status failed, partial or blocked (with needsEngineer). An honest "
+               f"non-pass is accepted; a missing or incomplete gate file is not. (send-back {n} of {MAX_SENDBACKS})")
+
+
+def pipeline_failures(root):
+    return run_gate(root, "check-pipeline", "all", "--since", str(RECENT_MIN))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ide", choices=["claude", "cursor"], required=True)
+    ap.add_argument("--event", choices=["subagent-stop", "stop"], required=True)
+    a = ap.parse_args()
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        payload = {}
+    trace(a.ide, a.event, payload)
+    cwd = payload.get("cwd") or (payload.get("workspace_roots") or [None])[0]
+    root = find_root(cwd)
+
+    if root and (a.event == "stop" or a.ide == "cursor"):
+        try:
+            record_changed_gates(root, a.ide)
+        except Exception as e:  # metrics never block a stop
+            log({"event": "metric-event-error", "error": f"{type(e).__name__}: {e}"[:200]})
+
+    if a.ide == "cursor":
+        out = {}
+        if root and int(payload.get("loop_count") or 0) < MAX_SENDBACKS:
+            failures = pipeline_failures(root)
+            if failures:
+                log({"ide": "cursor", "event": a.event, "decision": "followup", "failures": failures[:10]})
+                out = {"followup_message": "qa-stage-gate: a QA stage is reported as done without a complete gate file.\n- "
+                       + "\n- ".join(failures[:12]) + "\nFix the gate files with `qa-gate check-stage <TICKET> <STAGE>` "
+                       "until they pass, or record the stage honestly as failed, partial or blocked."}
+        print(json.dumps(out))
+        return 0
+
+    if not root:
+        return 0
+    if a.event == "subagent-stop":
+        code, msg = subagent_stop_claude(payload, root)
+    elif payload.get("stop_hook_active"):
+        code, msg = 0, ""
+    else:
+        failures = pipeline_failures(root)
+        code = 2 if failures else 0
+        msg = ("qa-stage-gate: before finishing, fix these gate problems (or tell the engineer why they stay):\n- "
+               + "\n- ".join(failures[:12])) if failures else ""
+        if failures:
+            log({"ide": "claude", "event": "Stop", "decision": "block", "failures": failures[:10]})
+    if msg:
+        print(msg, file=sys.stderr)
+    return code
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:  # a broken hook must never trap a session
+        print(f"qa-stage-gate internal error: {type(e).__name__}: {e}", file=sys.stderr)
+        sys.exit(0)

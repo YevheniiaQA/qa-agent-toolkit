@@ -1,0 +1,10 @@
+{
+  "_about": "USD per million tokens, used by qa-event / qa-stage-gate to price a stage from its transcript. Anthropic first-party API list prices as cached in the claude-api reference on 2026-10-06; cacheWrite is not listed there and is taken as 1.25 x input (the 5-minute cache rate); the Haiku cache read is not listed either and is taken as 0.1 x input. On a subscription plan the number is the API-equivalent cost, not the bill. Edit for your contract; a model missing here is reported with tokens and no cost.",
+  "asOf": "2026-10-06",
+  "models": {
+    "claude-fable-5-1":  {"in": 10.0, "out": 50.0, "cacheRead": 0.25, "cacheWrite": 12.5},
+    "claude-opus-5-5":   {"in": 4.0,  "out": 20.0, "cacheRead": 0.20, "cacheWrite": 5.0},
+    "claude-sonnet-5-5": {"in": 2.0,  "out": 10.0, "cacheRead": 0.20, "cacheWrite": 2.5},
+    "claude-haiku-5-5":  {"in": 0.10, "out": 0.50, "cacheRead": 0.01, "cacheWrite": 0.125}
+  }
+}

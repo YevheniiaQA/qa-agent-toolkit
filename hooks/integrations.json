@@ -1,0 +1,230 @@
+{
+  "_comment": "Vocabulary for qa-guard. 'always': hosts every QA project may reach. 'systems': the names allowed in a profile's INTEGRATIONS, with the hosts, profile variables, CLI commands and MCP server keywords that identify each. A host listed under a system is denied whenever that system is not in INTEGRATIONS, whatever NET_ALLOW says.",
+  "always": [
+    "localhost",
+    "*.localhost",
+    "*.local",
+    "host.docker.internal",
+    "registry.npmjs.org",
+    "registry.yarnpkg.com",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "cdn.playwright.dev",
+    "playwright.download.prss.microsoft.com",
+    "playwright.azureedge.net",
+    "*.anthropic.com",
+    "claude.ai",
+    "*.claude.ai",
+    "*.cursor.com",
+    "*.cursor.sh"
+  ],
+  "systems": {
+    "jira": {
+      "hosts": [
+        "*.atlassian.net",
+        "*.atlassian.com",
+        "*.jira.com"
+      ],
+      "notPaths": [
+        "/wiki"
+      ],
+      "vars": [
+        "JIRA_*"
+      ],
+      "commands": [
+        "jira",
+        "acli"
+      ],
+      "mcp": [
+        "jira"
+      ],
+      "mcpGeneric": [
+        "atlassian"
+      ]
+    },
+    "confluence": {
+      "hosts": [
+        "*.atlassian.net",
+        "*.atlassian.com"
+      ],
+      "paths": [
+        "/wiki"
+      ],
+      "vars": [
+        "CONFLUENCE_*",
+        "GC_SOURCE_CONFLUENCE"
+      ],
+      "mcp": [
+        "confluence"
+      ]
+    },
+    "figma": {
+      "hosts": [
+        "figma.com",
+        "*.figma.com"
+      ],
+      "vars": [
+        "FIGMA_*"
+      ],
+      "mcp": [
+        "figma"
+      ]
+    },
+    "testrail": {
+      "hosts": [
+        "*.testrail.io",
+        "*.testrail.com",
+        "*.testrail.net"
+      ],
+      "vars": [
+        "TESTRAIL_*"
+      ],
+      "mcp": [
+        "testrail"
+      ]
+    },
+    "zephyr": {
+      "hosts": [
+        "*.zephyrscale.smartbear.com",
+        "*.zephyr4jiracloud.com"
+      ],
+      "vars": [
+        "ZEPHYR_*"
+      ],
+      "mcp": [
+        "zephyr"
+      ]
+    },
+    "xray": {
+      "hosts": [
+        "*.getxray.app"
+      ],
+      "vars": [
+        "XRAY_*"
+      ],
+      "mcp": [
+        "xray"
+      ]
+    },
+    "qtest": {
+      "hosts": [
+        "*.qtestnet.com"
+      ],
+      "vars": [
+        "QTEST_*"
+      ],
+      "mcp": [
+        "qtest"
+      ]
+    },
+    "github": {
+      "hosts": [
+        "github.com",
+        "*.github.com",
+        "*.githubusercontent.com",
+        "ghcr.io"
+      ],
+      "vars": [
+        "GITHUB_*",
+        "GH_*",
+        "*_TESTS_REPO"
+      ],
+      "commands": [
+        "gh"
+      ],
+      "mcp": [
+        "github"
+      ]
+    },
+    "gitlab": {
+      "hosts": [
+        "gitlab.com",
+        "*.gitlab.com"
+      ],
+      "vars": [
+        "GITLAB_*"
+      ],
+      "commands": [
+        "glab"
+      ],
+      "mcp": [
+        "gitlab"
+      ]
+    },
+    "bitbucket": {
+      "hosts": [
+        "bitbucket.org",
+        "*.bitbucket.org"
+      ],
+      "vars": [
+        "BITBUCKET_*"
+      ],
+      "mcp": [
+        "bitbucket"
+      ]
+    },
+    "slack": {
+      "hosts": [
+        "slack.com",
+        "*.slack.com",
+        "*.slack-edge.com"
+      ],
+      "vars": [
+        "SLACK_*"
+      ],
+      "mcp": [
+        "slack"
+      ]
+    },
+    "linear": {
+      "hosts": [
+        "linear.app",
+        "*.linear.app"
+      ],
+      "vars": [
+        "LINEAR_*"
+      ],
+      "mcp": [
+        "linear"
+      ]
+    },
+    "pactflow": {
+      "hosts": [
+        "*.pactflow.io"
+      ],
+      "vars": [
+        "PACT_BROKER_*",
+        "PACTFLOW_*"
+      ],
+      "commands": [
+        "pact-broker"
+      ],
+      "mcp": [
+        "pactflow"
+      ]
+    },
+    "llm-review": {
+      "hosts": [
+        "api.openai.com",
+        "generativelanguage.googleapis.com",
+        "api.mistral.ai"
+      ],
+      "vars": [
+        "LLM_REVIEW_*"
+      ],
+      "commands": [
+        "codex",
+        "gemini",
+        "cursor-agent"
+      ],
+      "mcp": [
+        "openai",
+        "gemini"
+      ]
+    }
+  },
+  "readOnlySources": [
+    "GC_SOURCE_REPOS",
+    "GC_SOURCE_DOCS"
+  ]
+}
