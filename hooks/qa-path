@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# qa-path — SessionStart hook registered only by a project install (install.sh --project).
+# Puts this toolkit's bin/ on PATH for the Bash commands of that project's sessions, so the
+# skills find qa-gate, qa-pipeline, qa-event… without anything being added to the user's
+# shell profile or to ~/.qa-agent/bin. Claude Code sources $CLAUDE_ENV_FILE before each command.
+TK="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+[ -n "${CLAUDE_ENV_FILE:-}" ] || exit 0
+line="export PATH=\"$TK/bin:\$PATH\""
+grep -qxF "$line" "$CLAUDE_ENV_FILE" 2>/dev/null || echo "$line" >> "$CLAUDE_ENV_FILE"
+exit 0

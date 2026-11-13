@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # install.sh — connect this toolkit to Cursor and Claude Code on this machine.
 #
-# Usage:  ./install.sh [--copy] [--dry-run]
+# Usage:  ./install.sh [--copy] [--dry-run]                    for every project of this user
+#         ./install.sh --project DIR [--uninstall] [--dry-run]  for one project only
 #   (default)  symlink every skill into ~/.cursor/skills and ~/.claude/skills, and every
 #              stage agent (built per IDE by bin/qa-build-agents) into ~/.cursor/agents
 #              and ~/.claude/agents
@@ -9,6 +10,11 @@
 #   --copy     copy skills, agents and rules instead, for an IDE that does not follow symlinks;
 #              re-run after every change to the toolkit
 #   --dry-run  print what would change, change nothing
+#   --project DIR   install into DIR/.claude only (skills, agents, hooks in
+#              DIR/.claude/settings.json). Nothing under ~/.claude, ~/.cursor or ~/.qa-agent/bin
+#              is touched, so skills, plugins and connectors already installed stay as they are.
+#              Claude Code only. Re-run after updating the toolkit; --uninstall removes
+#              exactly what this mode installed.
 #
 # Also links ~/.qa-agent/bin to the toolkit's bin/ and registers the qa-guard hook in
 # ~/.claude/settings.json and ~/.cursor/hooks.json (hooks/register.py; --remove there
@@ -21,14 +27,20 @@ set -euo pipefail
 TK="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODE=link
 DRY=0
-for a in "$@"; do
-  case "$a" in
+PROJECT=""
+UNINSTALL=0
+while [ $# -gt 0 ]; do
+  case "$1" in
     --copy) MODE=copy ;;
     --dry-run) DRY=1 ;;
-    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
-    *) echo "install.sh: unknown option $a" >&2; exit 2 ;;
+    --project) [ $# -ge 2 ] || { echo "install.sh: --project needs a directory" >&2; exit 2; }; PROJECT="$2"; shift ;;
+    --uninstall) UNINSTALL=1 ;;
+    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    *) echo "install.sh: unknown option $1" >&2; exit 2 ;;
   esac
+  shift
 done
+[ "$UNINSTALL" = 1 ] && [ -z "$PROJECT" ] && { echo "install.sh: --uninstall works with --project DIR" >&2; exit 2; }
 
 TARGETS=("$HOME/.cursor/skills" "$HOME/.claude/skills")
 BK="$HOME/.qa-agent/backups/install-$(date +%Y%m%d-%H%M%S)"
@@ -42,6 +54,76 @@ set_aside() {
   run mv "$1" "$BK/$2/"
   echo "  backed up $1 -> $BK/$2/"
 }
+
+# ---- project install: everything stays inside <project>/.claude -------------------------
+if [ -n "$PROJECT" ]; then
+  [ -d "$PROJECT" ] || { echo "install.sh: no such directory: $PROJECT" >&2; exit 2; }
+  P="$(cd "$PROJECT" && pwd)"
+  case "$P" in "$HOME") echo "install.sh: --project is for a project folder, not your home directory" >&2; exit 2 ;; esac
+  case "$TK" in *" "*) echo "install.sh: the toolkit path contains a space ($TK); clone it to a path without spaces" >&2; exit 2 ;; esac
+  S="$P/.claude/skills"; A="$P/.claude/agents"
+  echo "toolkit: $TK   project: $P$([ "$UNINSTALL" = 1 ] && echo '   uninstall')$([ "$DRY" = 1 ] && echo ' (dry run)')"
+
+  if [ "$UNINSTALL" = 1 ]; then
+    n=0
+    for d in "$S"/*/; do
+      d=${d%/}; [ -f "$d/$MARK" ] || continue      # only what this mode copied
+      run rm -rf "$d"; n=$((n + 1))
+    done
+    echo "  $S: $n removed"
+    n=0
+    for f in "$A"/qa-*.md; do
+      [ -f "$f" ] && grep -q "built by qa-build-agents" "$f" || continue
+      run rm "$f"; n=$((n + 1))
+    done
+    echo "  $A: $n removed"
+    python3 "$TK/hooks/register.py" --project "$P" --remove $([ "$DRY" = 1 ] && echo --dry-run)
+    if [ "$DRY" = 0 ]; then rmdir "$S" "$A" "$P/.claude" 2>/dev/null || true; fi
+    exit 0
+  fi
+
+  # skills: copies, with the two home-relative toolkit paths pointed at this clone
+  run mkdir -p "$S" "$A"
+  changed=0
+  for src in "$TK"/skills/*/; do
+    src=${src%/}; n=$(basename "$src"); dst="$S/$n"
+    if { [ -e "$dst" ] || [ -L "$dst" ]; } && [ ! -f "$dst/$MARK" ]; then
+      echo "  SKIPPED $dst: exists and was not installed by this toolkit" >&2; continue
+    fi
+    if [ "$DRY" = 1 ]; then echo "  would: copy $src -> $dst"; changed=$((changed + 1)); continue; fi
+    rm -rf "$dst"; cp -R "$src" "$dst"; touch "$dst/$MARK"
+    changed=$((changed + 1))
+  done
+  echo "  $S: $changed skills"
+
+  # agents: the Claude Code build
+  if [ "$DRY" = 1 ]; then "$TK/bin/qa-build-agents" --check >/dev/null 2>&1 || true; else "$TK/bin/qa-build-agents" >/dev/null; fi
+  changed=0
+  for src in "$TK/build/claude/agents/"*.md; do
+    [ -e "$src" ] || continue
+    dst="$A/$(basename "$src")"
+    if [ -e "$dst" ] && ! grep -q "built by qa-build-agents" "$dst"; then
+      echo "  SKIPPED $dst: exists and was not installed by this toolkit" >&2; continue
+    fi
+    run cp "$src" "$dst"; changed=$((changed + 1))
+  done
+  echo "  $A: $changed agents"
+
+  if [ "$DRY" = 0 ]; then
+    # ~/.qa-agent/bin and ~/.qa-agent/toolkit in the copies -> this clone (never the user's home)
+    find "$S" "$A" -type f \( -name '*.md' -o -name '*.html' \) -print0 | while IFS= read -r -d '' f; do
+      case "$f" in "$S"/*) [ -f "$S/$(echo "${f#"$S"/}" | cut -d/ -f1)/$MARK" ] || continue ;; esac
+      case "$f" in "$A"/*) grep -q "built by qa-build-agents" "$f" || continue ;; esac
+      TK="$TK" perl -pi -e 's#(?:~|\$HOME)/\.qa-agent/bin#$ENV{TK}/bin#g; s#(?:~|\$HOME)/\.qa-agent/toolkit#$ENV{TK}#g' "$f"
+    done
+  fi
+
+  echo "hooks:"
+  python3 "$TK/hooks/register.py" --project "$P" $([ "$DRY" = 1 ] && echo --dry-run)
+  [ "$DRY" = 1 ] && exit 0
+  echo "ok: installed for $P only. Check with: $TK/bin/qa-check-isolation $P"
+  exit 0
+fi
 
 echo "toolkit: $TK   mode: $MODE$([ "$DRY" = 1 ] && echo ' (dry run)')"
 

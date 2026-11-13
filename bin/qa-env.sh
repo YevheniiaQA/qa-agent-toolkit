@@ -36,9 +36,10 @@ _qa_read() {
 qa_load() {
   local p="${1:-$(qa_project)}"
   [ -n "$p" ] || { echo "qa_load: no project given and no .qa-project found above $PWD" >&2; return 1; }
-  local dir="$HOME/.qa-agent/projects/$p"
+  local home="${QA_AGENT_HOME:-$HOME/.qa-agent}"
+  local dir="$home/projects/$p"
   [ -f "$dir/profile.env" ] || { echo "qa_load: no profile at $dir/profile.env" >&2; return 1; }
-  _qa_read "$HOME/.qa-agent/.env" strip
+  _qa_read "$home/.env" strip
   _qa_read "$dir/profile.env" strip
   _qa_read "$dir/secrets.env"
   export QA_PROJECT="$p"
