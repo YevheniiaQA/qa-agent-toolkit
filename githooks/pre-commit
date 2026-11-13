@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# pre-commit for the toolkit: skills, agents and rules stay well-formed and the agent build is
+# current. Enabled by install.sh (git config core.hooksPath githooks).
+set -e
+TK="$(git rev-parse --show-toplevel)"
+"$TK/bin/skill-lint" --quiet
+"$TK/bin/qa-build-agents" --check >/dev/null || { echo "pre-commit: agent build is stale — run bin/qa-build-agents"; exit 1; }
