@@ -1,0 +1,61 @@
+---
+description: Shared context protocol — when and how to record a lesson from a work block in 01-docs/context/lessons/ so the next agent or person starts from it
+alwaysApply: true
+---
+
+# Shared Context Protocol
+
+Knowledge from each work block is captured as one file in `01-docs/context/lessons/`, next to
+the project knowledge base that `global-context-builder` maintains in `01-docs/context/`, so
+every agent (human or AI) can reuse it on the next task. In a repository that is not a QA
+workspace (no `.qa-project`), use `docs/context/lessons/` instead.
+
+## When to write a lesson (offer it, do not wait to be asked)
+
+At the **end of a work block**, when any of these apply:
+
+1. Shared test infrastructure changed: fixtures, config, API clients or types, the Playwright
+   config, CI.
+2. Three or more spec files were restructured or merged, or a new feature folder was added.
+3. A new reusable pattern (fixture, helper, convention) was introduced that others should adopt.
+4. A backend quirk, flaky behaviour or environment-only defect was found: a runtime-vs-spec
+   mismatch, a rate limit, an ordering dependency.
+5. Environment variables, setup steps or the onboarding flow changed.
+6. A pull request was opened or merged that will be a reference point for later work.
+
+Skip it for one-line fixes, formatting, typo-only changes, or when the user says "quick fix,
+don't document".
+
+## When starting a task
+
+Before coding, read `01-docs/context/lessons/*.md` (newest first) and say which ones you are
+using. If a relevant lesson is missing, say so. A lesson does not override the knowledge base
+or a skill: where they disagree, flag the disagreement instead of picking one.
+
+## File layout
+
+- Path: `01-docs/context/lessons/<YYYY-MM-DD>-<short-kebab-slug>.md` (date first, so `ls` is
+  chronological).
+- One file per work block. Never edit an earlier file; write a new one that references it.
+
+## Required structure
+
+```markdown
+# Lesson: <Title>
+
+- **Branch:** <branch-name or "none">
+- **Date:** YYYY-MM-DD
+- **Area:** <paths or feature>
+
+## 1. Objective
+## 2. Key Decisions
+## 3. Important Context
+## 4. What Worked
+## 5. What Didn't Work
+## 6. Reusable Insights
+## 7. Next Agent Guidance
+```
+
+Concise and specific; written for someone with no prior context; actionable before complete.
+Include concrete file paths, test IDs, error codes and commands the next agent can paste. Never
+put a token, a password or a customer's data in a lesson.

@@ -1,0 +1,110 @@
+---
+description: Best practices for writing and reviewing API tests — coverage checklist, edge cases, negative scenarios, isolation
+globs: 03-tests/api/**
+alwaysApply: false
+---
+# API Test Best Practices
+
+Apply this checklist whenever you add or review a test under `03-tests/api/`. The goal is coverage
+that catches real regressions, not a green happy path. The `automation-api` skill is the full
+procedure; this rule is the checklist you keep in view while editing.
+
+## 1. Per-endpoint coverage
+
+For every endpoint, aim for at least one test in each category. Skip a row only with a written
+reason (a scenario waiver).
+
+| Category | What to verify |
+|---|---|
+| **Happy path** | Valid request → exact 2xx + response shape + the side effect visible on a later `GET` |
+| **Request validation** | Missing required field, empty string, wrong type, unknown extra field, oversize payload |
+| **Boundary values** | Min/max length, 0, 1, -1, the type's maximum, empty array, array of 1, array of N+1 |
+| **Unicode / formatting** | Emoji, RTL text, whitespace-only, leading/trailing spaces, SQL-ish `'; DROP`, `<script>` |
+| **Auth** | No token, an invalid token, an expired token, a token of another role |
+| **Authorization** | Right user, other tenant or owner → 403; admin-only endpoint called by a regular user |
+| **Resource state** | Unknown id (404), deleted id (404/410), duplicate create (409), invalid id format (400) |
+| **Idempotency** | Repeated PUT/PATCH → same state; DELETE of a deleted resource → 404 (or 204 if documented) |
+| **Concurrency** | Two parallel updates of one resource, when relevant |
+| **Pagination** | page, size, sort, an out-of-range page, an invalid sort field |
+| **Rate limit** | Not exercised against a shared environment; the expected 429 is documented |
+
+Only rows the system actually has: an API with no authentication has no auth row, and the
+waiver says so.
+
+## 2. Equivalence partitions and boundaries
+
+One value per equivalence class, then both sides of every boundary the contract states. Never
+invent a limit: an unstated limit is an open question, not a test value.
+
+```ts
+// a `name` declared as 1..100 characters in the contract
+const cases = [
+  { name: '', expect: 400 },               // below min
+  { name: 'a', expect: 201 },              // min
+  { name: 'a'.repeat(100), expect: 201 },  // max
+  { name: 'a'.repeat(101), expect: 400 },  // above max
+];
+```
+
+Data-drive with `for (const c of cases)`; do not copy tests.
+
+## 3. Response contract
+
+- Assert the exact status **and** the business fields, never only `response.ok()` or a range.
+- Assert the returned entity's id, the fields the request set, and server-generated fields.
+- For a list, assert the paging fields, that the items are an array, and the first item's key fields.
+- Validate against the documented schema; where the running system disagrees with the spec,
+  the scenario records which one the test follows and why.
+
+## 4. Negative scenario matrix
+
+Minimum per mutating endpoint, where the system has the concept:
+
+| Scenario | Expected status |
+|---|---|
+| Invalid or missing auth | `401` |
+| Forbidden for this role | `403` |
+| Unknown resource id | `404` |
+| Invalid body | `400` or `422`, as the contract says |
+| Duplicate or conflict | `409` |
+
+**A known product defect is never a relaxed test.** Keep the assertion on the required behaviour
+and mark the test `test.fail()` with the defect ID in the annotation, so it fails as expected
+today and turns into a finding the day the defect is fixed. `test.fixme` is only for a test that
+cannot run yet (missing data, missing environment), with the reason; never `test.skip` to hide a
+failure. `qa-test-lint` flags weakened assertions, `.only` and fixed waits on every write.
+
+## 5. State, isolation, cleanup
+
+- Never rely on data another test created; each test creates what it changes.
+- Generate unique values (faker or a run-scoped suffix) so parallel workers do not collide.
+- Destructive calls (DELETE, bulk PUT) only on records the same test or fixture created.
+- Clean up in `afterEach` from a list of created ids, not with `try/finally` around assertions.
+  A cleanup failure logs a warning and never throws, so it cannot mask the original failure.
+
+## 6. Auth
+
+Use the suite's worker-scoped auth fixture (the suite README names it): one sign-in per worker,
+no throttling. Sign in inside a test only to test signing in. Hard-code an invalid token only in
+the 401 test; real credentials come from the profile, never from the code.
+
+## 7. Naming and organisation
+
+- One file per feature intent, or per shared setup.
+- The title starts with the scenario ID: `'TC-<TICKET>-API-<NN> <what it does> <expected outcome>'`.
+  IDs are stable across refactors; they are the link to the scenario, the RTM and bug reports.
+- Tags (`@smoke`, `@regression`, `@<feature>`) let runners filter.
+
+## 8. Smells
+
+- Asserting only `response.ok()` or a status range.
+- A hard-coded id or email that other tests also use.
+- `beforeAll` creating data shared by several tests (worker-scoped fixtures excepted).
+- `try/catch {}` that swallows an error, in a test or in cleanup.
+
+## 9. Investigating a failure
+
+Run one test with `--workers=1 -g '<TEST-ID>'` and log `status()` and `text()` while you
+investigate; remove the log before committing. Classify the failure with `test-debugger`
+(test bug, product defect, environment, data) and record it with `qa-event triage`; a lesson
+worth keeping goes to `01-docs/context/lessons/` (see the shared context protocol).
